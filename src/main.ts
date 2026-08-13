@@ -526,6 +526,27 @@ let orbitLine: THREE.Group | undefined;
 let showAircraft = true;
 const maxAircraft = isMobile ? 500 : 1600;
 let aircraftApiRawCount = 0;
+type AircraftProvider = 'adsb.lol' | 'adsb.fi' | 'Airplanes.live' | 'OpenSky';
+let aircraftProvider: AircraftProvider | null = null;
+
+const aircraftProviderDetails: Record<AircraftProvider, { label: string; credit: string; url: string }> = {
+  'adsb.lol': { label: 'ADSB.LOL', credit: 'adsb.lol · ODbL 1.0', url: 'https://adsb.lol/' },
+  'adsb.fi': { label: 'ADSB.FI', credit: 'adsb.fi', url: 'https://adsb.fi/' },
+  'Airplanes.live': { label: 'AIRPLANES.LIVE', credit: 'Airplanes.live', url: 'https://airplanes.live/' },
+  OpenSky: { label: 'OPENSKY NETWORK', credit: 'OpenSky Network', url: 'https://opensky-network.org/' },
+};
+
+function aircraftProviderLabel() {
+  return aircraftProvider ? aircraftProviderDetails[aircraftProvider].label : 'PUBLIC ADS-B';
+}
+
+function updateAircraftAttribution() {
+  const credit = document.querySelector<HTMLAnchorElement>('#aircraft-source-credit');
+  if (!credit || !aircraftProvider) return;
+  const details = aircraftProviderDetails[aircraftProvider];
+  credit.textContent = details.credit;
+  credit.href = details.url;
+}
 
 const tierBInstanceToAircraftIndex: number[] = [];
 const tierAInstanceToAircraftIndex: number[] = [];
@@ -1264,10 +1285,12 @@ async function loadAircraft() {
     const response = await fetch(`/api/aircraft?${query.toString()}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const payload = (await response.json()) as { observedAt: number; states: TruthState[] };
+    const payload = (await response.json()) as { provider: AircraftProvider; observedAt: number; states: TruthState[] };
     aircraftApiRawCount = payload.states.length;
     const receivedAt = Date.now() / 1000;
     aircraftObservedAt = payload.observedAt;
+    aircraftProvider = payload.provider;
+    updateAircraftAttribution();
     aircraftAvailable = true;
 
     const oldMap = new Map<string, DisplayState>();
@@ -1339,11 +1362,11 @@ async function loadAircraft() {
     resolveSelectionIndices();
     updateAircraftPositions();
     $('#aircraft-status').textContent = `${aircraft.length.toLocaleString()} IN REGION`;
-    $('#aircraft-meta').textContent = `OPENSKY NETWORK · ${formatAge(receivedAt - aircraftObservedAt)} AGO`;
+    $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · ${formatAge(receivedAt - aircraftObservedAt)} AGO`;
   } catch {
     aircraftAvailable = false;
     $('#aircraft-status').textContent = 'UNAVAILABLE';
-    $('#aircraft-meta').textContent = 'OPENSKY NETWORK · NO RESPONSE';
+    $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · NO RESPONSE`;
   } finally {
     aircraftLoading = false;
   }
@@ -1578,10 +1601,10 @@ function updateStatuses(now: Date) {
   if (showAircraft) {
     if (aircraftAvailable) {
       $('#aircraft-status').textContent = `${freshAircraftCount.toLocaleString()} IN REGION`;
-      $('#aircraft-meta').textContent = `OPENSKY NETWORK · ${formatAge(now.getTime() / 1000 - aircraftObservedAt)} AGO`;
+      $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · ${formatAge(now.getTime() / 1000 - aircraftObservedAt)} AGO`;
     } else {
       $('#aircraft-status').textContent = 'UNAVAILABLE';
-      $('#aircraft-meta').textContent = 'OPENSKY NETWORK · NO RESPONSE';
+      $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · NO RESPONSE`;
     }
   } else {
     $('#aircraft-status').textContent = 'LAYER HIDDEN';

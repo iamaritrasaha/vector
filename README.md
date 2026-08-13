@@ -22,7 +22,7 @@ VECTOR is an independent interactive 3D visualization of Earth, public orbital o
 ## Data sources and integrity
 
 - **Satellite orbital data:** [CelesTrak](https://celestrak.org/) public GP catalog in OMM/JSON form. VECTOR propagates these elements locally to current UTC using SGP4; rendered positions are not direct spacecraft telemetry.
-- **Aircraft observations:** [OpenSky Network](https://opensky-network.org/) state vectors. These are recent sensor-network observations whose coverage, source and freshness vary. Visual interpolation does not constitute a new observation.
+- **Aircraft observations:** Runtime-selected public ADS-B observations from [adsb.lol](https://adsb.lol/) (primary, ODbL 1.0) and [adsb.fi](https://adsb.fi/) (fallback). [Airplanes.live](https://airplanes.live/) and [OpenSky Network](https://opensky-network.org/) remain opt-in server-side fallbacks. These are recent sensor-network observations whose coverage, source and freshness vary. Visual interpolation does not constitute a new observation.
 - **Geographic reference data:** [Natural Earth](https://www.naturalearthdata.com/) 1:50m coastlines, Admin-0 boundaries and disputed-boundary classifications.
 - **Orbital propagation:** [Satellite.js](https://github.com/shashwatak/satellite-js), implementing SGP4/SDP4 coordinate and propagation utilities.
 
@@ -47,22 +47,22 @@ The `/api` directory contains serverless handlers. A static-only server can rend
 
 ## Environment variables
 
-OpenSky OAuth credentials must be configured only in the server/serverless environment:
+The preferred production aircraft path uses public regional APIs and requires no credentials. OpenSky OAuth credentials are optional and must be configured only in the server/serverless environment:
 
 ```text
 OPENSKY_CLIENT_ID
 OPENSKY_CLIENT_SECRET
 ```
 
-Never prefix the secret with `VITE_` or expose it to browser code. No OpenSky credentials are required for the static geography or CelesTrak GP proxy.
+Set `AIRCRAFT_ENABLE_AIRPLANES_LIVE_FALLBACK=true` or `AIRCRAFT_ENABLE_OPENSKY_FALLBACK=true` only when those optional fallbacks should be enabled. Never prefix these values with `VITE_` or expose them to browser code. No OpenSky credentials are required for the preferred aircraft path, static geography, or CelesTrak GP proxy.
 
 ### OpenSky configuration
 
-1. Obtain an OpenSky API client.
-2. Copy `.env.example` to `.env.local` and set the server-side `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` values.
+1. Obtain an OpenSky API client only if the optional fallback is desired.
+2. Copy `.env.example` to `.env.local`, set the server-side `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` values, and enable `AIRCRAFT_ENABLE_OPENSKY_FALLBACK`.
 3. Never expose either credential through `VITE_*` variables or frontend source.
 
-`npm run dev` loads `.env.local` only into the local Vite server and serves the normalized aircraft route at `/api/aircraft`. Production deployments use the serverless handler in `api/aircraft.ts` and must configure the same variables in the hosting environment.
+`npm run dev` serves the normalized aircraft route at `/api/aircraft`. Production deployments use the same provider-adapter handler in `api/aircraft.ts`; OpenSky variables are needed only when its optional fallback is enabled.
 
 ## Disclaimer
 

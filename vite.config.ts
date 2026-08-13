@@ -21,8 +21,10 @@ function localApi(path: string, handler: WebHandler): Plugin {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'OPENSKY_');
+  const aircraftEnv = loadEnv(mode, process.cwd(), 'AIRCRAFT_');
   process.env.OPENSKY_CLIENT_ID = env.OPENSKY_CLIENT_ID;
   process.env.OPENSKY_CLIENT_SECRET = env.OPENSKY_CLIENT_SECRET;
+  process.env.AIRCRAFT_ENABLE_OPENSKY_FALLBACK = aircraftEnv.AIRCRAFT_ENABLE_OPENSKY_FALLBACK;
   return {
     plugins: [
       localApi('/api/aircraft', aircraftHandler),
