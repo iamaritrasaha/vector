@@ -12,20 +12,46 @@ const regionCache = new Map<string, { expiresAt: number; payload: AircraftPayloa
 const pendingRegions = new Map<string, Promise<AircraftPayload>>();
 const cacheLifetime = 26_000;
 
+function safeErrorInformation(error: unknown) {
+  const message = error instanceof Error ? error.message : 'OPENSKY_UNKNOWN_ERROR';
+  const code = /^(?:OPENSKY_[A-Z_]+(?:_\d{3})?|INVALID_BOUNDING_BOX)$/.test(message)
+    ? message
+    : 'OPENSKY_UNEXPECTED_ERROR';
+  return { code, message: code };
+}
+
 async function accessToken() {
   if (token && Date.now() < expiresAt) return token;
   const clientId = process.env.OPENSKY_CLIENT_ID;
   const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
-  if (!clientId || !clientSecret) throw Error('OpenSky credentials are not configured');
-  const response = await fetch('https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret }),
+  console.info('[VECTOR aircraft]', {
+    clientIdConfigured: Boolean(clientId),
+    clientSecretConfigured: Boolean(clientSecret),
   });
-  if (!response.ok) throw Error('OpenSky token request failed');
-  const body = await response.json() as { access_token: string; expires_in?: number };
+  if (!clientId || !clientSecret) throw Error('OPENSKY_CREDENTIALS_MISSING');
+  let response: Response;
+  try {
+    response = await fetch('https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret }),
+    });
+  } catch {
+    console.info('[VECTOR aircraft]', { tokenRequestStatus: 'NETWORK_ERROR' });
+    throw Error('OPENSKY_TOKEN_NETWORK_ERROR');
+  }
+  console.info('[VECTOR aircraft]', { tokenRequestStatus: response.status });
+  if (!response.ok) throw Error(`OPENSKY_TOKEN_HTTP_${response.status}`);
+  let body: { access_token?: unknown; expires_in?: unknown };
+  try {
+    body = await response.json() as { access_token?: unknown; expires_in?: unknown };
+  } catch {
+    throw Error('OPENSKY_TOKEN_INVALID_RESPONSE');
+  }
+  if (typeof body.access_token !== 'string' || !body.access_token) throw Error('OPENSKY_TOKEN_INVALID_RESPONSE');
   token = body.access_token;
-  expiresAt = Date.now() + ((body.expires_in ?? 1800) - 45) * 1000;
+  const expiresIn = typeof body.expires_in === 'number' ? body.expires_in : 1800;
+  expiresAt = Date.now() + (expiresIn - 45) * 1000;
   return token;
 }
 
@@ -46,9 +72,18 @@ async function retrieveRegion(key: string, bounds: AircraftPayload['bounds']) {
   if (inFlight) return inFlight;
 
   const request = (async () => {
+    console.info('[VECTOR aircraft]', { snappedBoundingBox: bounds });
     const query = new URLSearchParams({ ...Object.fromEntries(Object.entries(bounds).map(([name, value]) => [name, String(value)])), extended: '1' });
-    const upstream = await fetch(`https://opensky-network.org/api/states/all?${query}`, { headers: { authorization: `Bearer ${await accessToken()}` } });
-    if (!upstream.ok) throw Error(`OpenSky returned ${upstream.status}`);
+    const bearerToken = await accessToken();
+    let upstream: Response;
+    try {
+      upstream = await fetch(`https://opensky-network.org/api/states/all?${query}`, { headers: { authorization: `Bearer ${bearerToken}` } });
+    } catch {
+      console.info('[VECTOR aircraft]', { statesRequestStatus: 'NETWORK_ERROR' });
+      throw Error('OPENSKY_STATES_NETWORK_ERROR');
+    }
+    console.info('[VECTOR aircraft]', { statesRequestStatus: upstream.status });
+    if (!upstream.ok) throw Error(`OPENSKY_STATES_HTTP_${upstream.status}`);
     const body = await upstream.json() as { time: number; states: Array<(string | number | boolean | null)[]> | null };
     const states = (body.states ?? []).map(row => ({
       icao24: row[0], callsign: typeof row[1] === 'string' ? row[1].trim() : null, country: row[2],
@@ -77,12 +112,13 @@ export default {
       const searchParams = new URL(request.url).searchParams;
       const values = ['lamin', 'lomin', 'lamax', 'lomax'].map(key => Number(searchParams.get(key)));
       const [lamin, lomin, lamax, lomax] = values;
-      if (values.some(value => !Number.isFinite(value)) || lamin < -90 || lamax > 90 || lomin < -180 || lomax > 180 || lamin >= lamax || lomin >= lomax || (lamax - lamin) * (lomax - lomin) > 900) throw Error('Invalid bounding box');
+      if (values.some(value => !Number.isFinite(value)) || lamin < -90 || lamax > 90 || lomin < -180 || lomax > 180 || lamin >= lamax || lomin >= lomax || (lamax - lamin) * (lomax - lomin) > 900) throw Error('INVALID_BOUNDING_BOX');
       const region = sharedRegion(lamin, lomin, lamax, lomax);
       return Response.json(await retrieveRegion(region.key, region.bounds), {
         headers: { 'cache-control': 's-maxage=26, stale-while-revalidate=12' },
       });
-    } catch {
+    } catch (error) {
+      console.error('[VECTOR aircraft]', safeErrorInformation(error));
       return Response.json({ error: 'ADS-B UNAVAILABLE', states: [] }, { status: 503 });
     }
   },
