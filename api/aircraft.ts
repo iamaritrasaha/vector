@@ -1,6 +1,3 @@
-type ApiResponse = { status: (code: number) => { json: (body: unknown) => void }; setHeader: (name: string, value: string) => void };
-type ApiRequest = { query?: Record<string, string | string[] | undefined> };
-
 let token = '';
 let expiresAt = 0;
 
@@ -32,7 +29,6 @@ async function accessToken() {
   return token;
 }
 
-const scalar = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] : value;
 const positionSources = ['ADS-B', 'ASTERIX', 'MLAT', 'FLARM'];
 
 function sharedRegion(lamin: number, lomin: number, lamax: number, lomax: number) {
@@ -71,15 +67,23 @@ async function retrieveRegion(key: string, bounds: AircraftPayload['bounds']) {
   try { return await request; } finally { pendingRegions.delete(key); }
 }
 
-export default async function handler(request: ApiRequest, response: ApiResponse) {
-  try {
-    const values = ['lamin', 'lomin', 'lamax', 'lomax'].map(key => Number(scalar(request.query?.[key])));
-    const [lamin, lomin, lamax, lomax] = values;
-    if (values.some(value => !Number.isFinite(value)) || lamin < -90 || lamax > 90 || lomin < -180 || lomax > 180 || lamin >= lamax || lomin >= lomax || (lamax - lamin) * (lomax - lomin) > 900) throw Error('Invalid bounding box');
-    const region = sharedRegion(lamin, lomin, lamax, lomax);
-    response.setHeader('cache-control', 's-maxage=26, stale-while-revalidate=12');
-    response.status(200).json(await retrieveRegion(region.key, region.bounds));
-  } catch {
-    response.status(503).json({ error: 'ADS-B UNAVAILABLE', states: [] });
-  }
-}
+export default {
+  async fetch(request: Request) {
+    if (request.method !== 'GET') {
+      return Response.json({ error: 'METHOD NOT ALLOWED' }, { status: 405, headers: { allow: 'GET' } });
+    }
+
+    try {
+      const searchParams = new URL(request.url).searchParams;
+      const values = ['lamin', 'lomin', 'lamax', 'lomax'].map(key => Number(searchParams.get(key)));
+      const [lamin, lomin, lamax, lomax] = values;
+      if (values.some(value => !Number.isFinite(value)) || lamin < -90 || lamax > 90 || lomin < -180 || lomax > 180 || lamin >= lamax || lomin >= lomax || (lamax - lamin) * (lomax - lomin) > 900) throw Error('Invalid bounding box');
+      const region = sharedRegion(lamin, lomin, lamax, lomax);
+      return Response.json(await retrieveRegion(region.key, region.bounds), {
+        headers: { 'cache-control': 's-maxage=26, stale-while-revalidate=12' },
+      });
+    } catch {
+      return Response.json({ error: 'ADS-B UNAVAILABLE', states: [] }, { status: 503 });
+    }
+  },
+};

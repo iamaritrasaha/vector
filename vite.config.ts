@@ -2,47 +2,18 @@ import { defineConfig, loadEnv, type Plugin } from 'vite';
 import aircraftHandler from './api/aircraft';
 import satellitesHandler from './api/satellites';
 
-function aircraftApi(): Plugin {
-  return {
-    name: 'vector-aircraft-api',
-    configureServer(server) {
-      server.middlewares.use('/api/aircraft', async (request, response) => {
-        const url = new URL(request.url ?? '/', 'http://localhost');
-        const query = Object.fromEntries(url.searchParams);
-        await aircraftHandler(
-          { query },
-          {
-            setHeader: (name, value) => response.setHeader(name, value),
-            status: code => ({ json: body => {
-              response.statusCode = code;
-              response.setHeader('content-type', 'application/json');
-              response.end(JSON.stringify(body));
-            } }),
-          },
-        );
-      });
-    },
-  };
-}
+type WebHandler = { fetch(request: Request): Response | Promise<Response> };
 
-function satellitesApi(): Plugin {
+function localApi(path: string, handler: WebHandler): Plugin {
   return {
-    name: 'vector-satellites-api',
+    name: `vector-local-api-${path.slice(1)}`,
     configureServer(server) {
-      server.middlewares.use('/api/satellites', async (request, response) => {
-        const url = new URL(request.url ?? '/', 'http://localhost');
-        const query = Object.fromEntries(url.searchParams);
-        await satellitesHandler(
-          { query },
-          {
-            setHeader: (name, value) => response.setHeader(name, value),
-            status: code => ({ json: body => {
-              response.statusCode = code;
-              response.setHeader('content-type', 'application/json');
-              response.end(JSON.stringify(body));
-            } }),
-          },
-        );
+      server.middlewares.use(path, async (request, response) => {
+        const url = new URL(request.url ?? '/', `http://localhost${path}`);
+        const webResponse = await handler.fetch(new Request(url, { method: request.method ?? 'GET' }));
+        response.statusCode = webResponse.status;
+        webResponse.headers.forEach((value, name) => response.setHeader(name, value));
+        response.end(Buffer.from(await webResponse.arrayBuffer()));
       });
     },
   };
@@ -52,5 +23,10 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'OPENSKY_');
   process.env.OPENSKY_CLIENT_ID = env.OPENSKY_CLIENT_ID;
   process.env.OPENSKY_CLIENT_SECRET = env.OPENSKY_CLIENT_SECRET;
-  return { plugins: [aircraftApi(), satellitesApi()] };
+  return {
+    plugins: [
+      localApi('/api/aircraft', aircraftHandler),
+      localApi('/api/satellites', satellitesHandler),
+    ],
+  };
 });

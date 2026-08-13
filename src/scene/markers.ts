@@ -7,6 +7,13 @@ const sharedLineMaterial = new THREE.LineBasicMaterial({
   depthWrite: false,
 });
 
+const selectionBracketMaterial = new THREE.LineBasicMaterial({
+  color: 0x9be8ff,
+  transparent: true,
+  opacity: 0.62,
+  depthWrite: false,
+});
+
 function segments(points: number[]) {
   return new THREE.BufferGeometry().setAttribute(
     'position',
@@ -157,3 +164,17 @@ export function createAircraftGlyph() {
   return glyph;
 }
 
+/** Compact four-corner aerospace selection brackets, normalized to one unit. */
+export function createSelectionBrackets() {
+  const bracket = new THREE.LineSegments(
+    segments([
+      -0.50, 0.32, 0, -0.50, 0.50, 0, -0.50, 0.50, 0, -0.32, 0.50, 0,
+       0.32, 0.50, 0,  0.50, 0.50, 0,  0.50, 0.50, 0,  0.50, 0.32, 0,
+      -0.50,-0.32, 0, -0.50,-0.50, 0, -0.50,-0.50, 0, -0.32,-0.50, 0,
+       0.32,-0.50, 0,  0.50,-0.50, 0,  0.50,-0.50, 0,  0.50,-0.32, 0,
+    ]),
+    selectionBracketMaterial
+  );
+  bracket.renderOrder = 3;
+  return bracket;
+}

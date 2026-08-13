@@ -92,6 +92,14 @@
         <span class="key">FRAME</span>
         <span class="val">ECEF / ECI</span>
       </div>
+      <div class="telemetry-divider"></div>
+      <div class="earth-rate-control interactive" aria-label="Earth rotation visualization rate">
+        <span class="key">EARTH RATE</span>
+        <button class="earth-rate-btn active" data-earth-rate="1" aria-pressed="true">1×</button>
+        <button class="earth-rate-btn" data-earth-rate="60" aria-pressed="false">60×</button>
+        <button class="earth-rate-btn" data-earth-rate="240" aria-pressed="false">240×</button>
+        <span id="earth-rate-state" class="earth-rate-state">REALTIME</span>
+      </div>
     </div>
 
     <!-- Bottom-Right Precision Control Toolbar -->

@@ -8,6 +8,7 @@ import {
   createAircraftGlyph,
   createAircraftMarkerGeometry,
   createAircraftMicroGlyphGeometry,
+  createSelectionBrackets,
   createSatelliteGlyph,
   createSatelliteGlyphGeometry,
 } from './scene/markers';
@@ -90,6 +91,73 @@ const currentEarthOrientation: EarthOrientationState = {
   rotAngleDeg: 0,
   quaternion: new THREE.Quaternion(),
 };
+
+type EarthTimeScale = 1 | 60 | 240;
+const SIDEREAL_DAY_MS = 86_164_090.5;
+let earthTimeScale: EarthTimeScale = 1;
+let earthClockAnchorRealMs = Date.now();
+let earthClockAnchorSimulationMs = earthClockAnchorRealMs;
+let earthRealtimeReconciliation: { startedAtMs: number; offsetMs: number; durationMs: number } | null = null;
+
+function earthSimulationTimeMs(realUtcMs: number) {
+  if (earthRealtimeReconciliation) {
+    const progress = THREE.MathUtils.clamp(
+      (realUtcMs - earthRealtimeReconciliation.startedAtMs) / earthRealtimeReconciliation.durationMs,
+      0,
+      1
+    );
+    const eased = THREE.MathUtils.smoothstep(progress, 0, 1);
+    const simulationMs = realUtcMs + earthRealtimeReconciliation.offsetMs * (1 - eased);
+    if (progress >= 1) {
+      earthRealtimeReconciliation = null;
+      earthClockAnchorRealMs = realUtcMs;
+      earthClockAnchorSimulationMs = realUtcMs;
+      updateEarthRateControl();
+    }
+    return simulationMs;
+  }
+  return earthClockAnchorSimulationMs + (realUtcMs - earthClockAnchorRealMs) * earthTimeScale;
+}
+
+function updateEarthRateControl() {
+  document.querySelectorAll<HTMLButtonElement>('.earth-rate-btn').forEach((button) => {
+    const active = Number(button.dataset.earthRate) === earthTimeScale;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+  const state = $('#earth-rate-state');
+  state.textContent = earthRealtimeReconciliation
+    ? 'SYNCING'
+    : earthTimeScale === 1
+      ? 'REALTIME'
+      : `VISUAL ×${earthTimeScale}`;
+}
+
+function setEarthTimeScale(nextScale: EarthTimeScale) {
+  if (nextScale === earthTimeScale && !earthRealtimeReconciliation) return;
+  const realUtcMs = Date.now();
+  const currentSimulationMs = earthSimulationTimeMs(realUtcMs);
+  earthTimeScale = nextScale;
+
+  if (nextScale === 1) {
+    const realGmst = satellite.gstime(new Date(realUtcMs));
+    const simulationGmst = satellite.gstime(new Date(currentSimulationMs));
+    const shortestAngle = Math.atan2(
+      Math.sin(simulationGmst - realGmst),
+      Math.cos(simulationGmst - realGmst)
+    );
+    earthRealtimeReconciliation = {
+      startedAtMs: realUtcMs,
+      offsetMs: (shortestAngle / (Math.PI * 2)) * SIDEREAL_DAY_MS,
+      durationMs: 1200,
+    };
+  } else {
+    earthRealtimeReconciliation = null;
+    earthClockAnchorRealMs = realUtcMs;
+    earthClockAnchorSimulationMs = currentSimulationMs;
+  }
+  updateEarthRateControl();
+}
 
 function updateEarthOrientation(date: Date) {
   const gmst = satellite.gstime(date);
@@ -266,7 +334,7 @@ addGeoFeatures(disputedBorders, borderMaterial);
 
 // 3. Subtle Latitude & Longitude Wireframe Grid Lines
 const gridGroup = new THREE.Group();
-const gridMat = new THREE.LineBasicMaterial({ color: 0x243846, transparent: true, opacity: 0.10, depthWrite: false });
+const gridMat = new THREE.LineBasicMaterial({ color: 0x2f4c5b, transparent: true, opacity: 0.15, depthWrite: false });
 
 for (let lat = -60; lat <= 60; lat += 30) {
   const pts: THREE.Vector3[] = [];
@@ -284,6 +352,22 @@ for (let lon = 0; lon < 360; lon += 30) {
   gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
 }
 earth.add(gridGroup);
+
+// Earth-fixed reference lines provide a quiet visual comparison against the
+// inertial satellite field without altering sidereal truth.
+const earthReferenceMat = new THREE.LineBasicMaterial({ color: 0x6d9caf, transparent: true, opacity: 0.34, depthWrite: false });
+function earthReferenceCircle(latitude: number, longitude: number, isMeridian: boolean) {
+  const points: THREE.Vector3[] = [];
+  for (let step = 0; step <= 120; step++) {
+    const value = -180 + step * 3;
+    points.push(isMeridian
+      ? latLonToVector3(value / 2, longitude, earthRadius + 0.006)
+      : latLonToVector3(latitude, value, earthRadius + 0.006));
+  }
+  return new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), earthReferenceMat);
+}
+earth.add(earthReferenceCircle(0, 0, false));
+earth.add(earthReferenceCircle(0, 0, true));
 
 // Restrained Astronomical Instrumentation & Axes
 const instrumentGroup = new THREE.Group();
@@ -431,15 +515,12 @@ selectedSatGlyph.scale.setScalar(0.40);
 selectedSatGlyph.visible = false;
 satelliteGlyphs.add(selectedSatGlyph);
 
-// Compact Satellite Selection Halo Ring (Max diameter ~12-16px)
-const selectedSatHalo = new THREE.Mesh(
-  new THREE.RingGeometry(0.045, 0.065, 24),
-  new THREE.MeshBasicMaterial({ color: 0x8be4ff, transparent: true, opacity: 0.75, side: THREE.DoubleSide })
-);
+// Compact four-corner selection brackets; no circular targeting treatment.
+const selectedSatHalo = createSelectionBrackets();
 selectedSatHalo.visible = false;
 equatorialFrame.add(selectedSatHalo);
 
-let orbitLine: THREE.Line | undefined;
+let orbitLine: THREE.Group | undefined;
 
 // Aircraft Layer State, Instanced Meshes & Explicit Picking Mappings
 let showAircraft = true;
@@ -471,7 +552,7 @@ aircraftMarkersTierA.count = 0;
 aircraftMarkersTierA.frustumCulled = false;
 earth.add(aircraftMarkersTierA);
 
-// Refined Trajectory Trails (Fine fading trace: · · · ─ ─ ─ ✈)
+// Refined trajectory history: fading technical points toward the aircraft.
 const maxTrailSegments = maxAircraft * 45;
 const aircraftTrailPositions = new Float32Array(maxTrailSegments * 6);
 const aircraftTrailColors = new Float32Array(maxTrailSegments * 6);
@@ -480,9 +561,9 @@ aircraftTrailGeometry.setAttribute('position', new THREE.BufferAttribute(aircraf
 aircraftTrailGeometry.setAttribute('color', new THREE.BufferAttribute(aircraftTrailColors, 3).setUsage(THREE.DynamicDrawUsage));
 aircraftTrailGeometry.setDrawRange(0, 0);
 
-const aircraftTrails = new THREE.LineSegments(
+const aircraftTrails = new THREE.Points(
   aircraftTrailGeometry,
-  new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.45, depthWrite: false, depthTest: true })
+  new THREE.PointsMaterial({ vertexColors: true, transparent: true, opacity: 0.68, depthWrite: false, depthTest: true, size: 1.45, sizeAttenuation: false })
 );
 aircraftTrails.frustumCulled = false;
 aircraftTrails.renderOrder = 1;
@@ -493,10 +574,7 @@ const selectedAircraftGlyph = createAircraftGlyph();
 selectedAircraftGlyph.visible = false;
 earth.add(selectedAircraftGlyph);
 
-const selectedAircraftHalo = new THREE.Mesh(
-  new THREE.RingGeometry(0.048, 0.072, 24),
-  new THREE.MeshBasicMaterial({ color: 0x9be8ff, transparent: true, opacity: 0.75, side: THREE.DoubleSide })
-);
+const selectedAircraftHalo = createSelectionBrackets();
 selectedAircraftHalo.visible = false;
 earth.add(selectedAircraftHalo);
 
@@ -541,6 +619,19 @@ const aircraftQuaternionTemp = new THREE.Quaternion();
 const aircraftScaleTemp = new THREE.Vector3();
 const aircraftColorTemp = new THREE.Color();
 const aircraftLatestTemp = new THREE.Vector3();
+
+type LandmarkProbe = { label: string; lat: number; lon: number; screen: THREE.Vector2; start: THREE.Vector2; deltaPx: number; visible: boolean };
+const landmarkProbes: LandmarkProbe[] = [
+  { label: 'GREENWICH', lat: 51.4779, lon: 0, screen: new THREE.Vector2(), start: new THREE.Vector2(), deltaPx: 0, visible: false },
+  { label: 'INDIA', lat: 22.5726, lon: 88.3639, screen: new THREE.Vector2(), start: new THREE.Vector2(), deltaPx: 0, visible: false },
+  { label: 'JAPAN', lat: 35.6762, lon: 139.6503, screen: new THREE.Vector2(), start: new THREE.Vector2(), deltaPx: 0, visible: false },
+  { label: 'NORTH AMERICA', lat: 39.8283, lon: -98.5795, screen: new THREE.Vector2(), start: new THREE.Vector2(), deltaPx: 0, visible: false },
+];
+let landmarkProbeStartedAt = 0;
+let gmstProbeStartDeg = 0;
+let gmstDeltaDeg = 0;
+let landmarkProbeElapsedSec = 0;
+let landmarkProbeWarmupFrames = 0;
 
 const satMatrixTemp = new THREE.Matrix4();
 const satPosTemp = new THREE.Vector3();
@@ -626,7 +717,12 @@ function updateAircraftTrails(nowSeconds: number, cameraDistance: number) {
       histItem.pos.toArray(aircraftTrailPositions, offset + 3);
 
       if (isSelected) {
-        aircraftTrailColors.set([0.2, 0.85, 1.0, 0.55, 0.95, 1.0], offset);
+        const selectedBrightness = 0.16 + life * 0.62;
+        aircraftTrailColors.set(
+          [selectedBrightness * 0.42, selectedBrightness * 0.84, selectedBrightness,
+           selectedBrightness * 0.28, selectedBrightness * 0.66, selectedBrightness * 0.84],
+          offset
+        );
       } else {
         aircraftTrailColors.set(
           [brightness * 0.25, brightness * 0.55, brightness * 0.70, brightness * 0.40, brightness * 0.75, brightness * 0.90],
@@ -667,6 +763,23 @@ function isBehindEarth(world: THREE.Vector3) {
   const direction = toPoint.multiplyScalar(1 / length);
   const closestT = THREE.MathUtils.clamp(-camera.position.dot(direction), 0, length);
   return camera.position.clone().addScaledVector(direction, closestT).length() < earthRadius - 0.002;
+}
+
+function updateLandmarkProbes(nowSeconds: number) {
+  landmarkProbeWarmupFrames++;
+  for (const probe of landmarkProbes) {
+    const world = latLonToVector3(probe.lat, probe.lon, earthRadius + 0.009).applyMatrix4(earth.matrixWorld);
+    const result = projectWorldPosition(world, probe.screen);
+    probe.visible = result.visible && !isBehindEarth(world);
+    probe.deltaPx = probe.screen.distanceTo(probe.start);
+  }
+  if (!landmarkProbeStartedAt && landmarkProbeWarmupFrames >= 3) {
+    landmarkProbeStartedAt = nowSeconds;
+    gmstProbeStartDeg = currentEarthOrientation.rotAngleDeg;
+    for (const probe of landmarkProbes) probe.start.copy(probe.screen);
+  }
+  landmarkProbeElapsedSec = landmarkProbeStartedAt ? nowSeconds - landmarkProbeStartedAt : 0;
+  gmstDeltaDeg = THREE.MathUtils.euclideanModulo(currentEarthOrientation.rotAngleDeg - gmstProbeStartDeg, 360);
 }
 
 function updateMotionProbes(nowSeconds: number) {
@@ -1007,8 +1120,8 @@ function updateDomLabels(cameraDistance: number) {
         labelEl.style.opacity = String(Math.min(1.0, motion.opacity));
 
         labelEl.innerHTML = showSubtext
-          ? `<div class="callsign">✈ ${escapeHtml(callsign)}</div><div class="subtext">${flAlt} · ${speedMps}</div>`
-          : `<div class="callsign">✈ ${escapeHtml(callsign)}</div>`;
+          ? `<div class="callsign">${escapeHtml(callsign)}</div><div class="subtext">${flAlt} · ${speedMps}</div>`
+          : `<div class="callsign">${escapeHtml(callsign)}</div>`;
 
         poolIdx++;
       }
@@ -1060,7 +1173,7 @@ function updateDomLabels(cameraDistance: number) {
         labelEl.style.left = `${screenX}px`;
         labelEl.style.top = `${screenY}px`;
         labelEl.style.opacity = isSelected ? '1.0' : '0.80';
-        labelEl.innerHTML = `<div class="callsign" style="color: #6acbfb;">🛰 ${escapeHtml(nameStr)}</div>`;
+        labelEl.innerHTML = `<div class="callsign" style="color: #6acbfb;">${escapeHtml(nameStr)}</div>`;
         poolIdx++;
       }
     }
@@ -1098,6 +1211,7 @@ function selectAircraft(index: number) {
   cameraMode = 'MANUAL';
   selectedAircraftGlyph.visible = true;
   selectedAircraftHalo.visible = true;
+  $('#status-drawer').style.opacity = '0';
   updateAircraftInspector();
 }
 
@@ -1109,25 +1223,18 @@ function updateAircraftInspector() {
   $('#inspector').hidden = false;
   const callsign = (truth.callsign || truth.icao24).trim();
   const trackDeg = motion.trueTrack !== null ? `${Math.round(motion.trueTrack)}°` : '—';
-  const speedKnots = Math.round(motion.velocity * 1.94384);
 
   $('#inspector').innerHTML = `
     <div class="inspector-header">
-      <h2>${escapeHtml(callsign)}</h2>
-      <span class="type-badge">AIRCRAFT · ${escapeHtml(truth.country)}</span>
+      <div><span class="inspector-kicker">AIRCRAFT</span><h2>${escapeHtml(callsign)}</h2><span class="inspector-id">ICAO24 ${escapeHtml(truth.icao24.toUpperCase())}</span></div>
+      <span class="type-badge">LIVE</span>
     </div>
     <dl class="inspector-grid">
-      <dt>ICAO24</dt><dd>${escapeHtml(truth.icao24.toUpperCase())}</dd>
-      <dt>CALLSIGN</dt><dd>${escapeHtml(callsign)}</dd>
       <dt>GEO ALTITUDE</dt><dd>${(motion.altitude / 1000).toFixed(2)} km</dd>
-      <dt>BARO ALTITUDE</dt><dd>${truth.barometricAltitude ? (truth.barometricAltitude / 1000).toFixed(2) + ' km' : '—'}</dd>
-      <dt>AIRSPEED</dt><dd>${speedKnots} kts (${Math.round(motion.velocity)} m/s)</dd>
-      <dt>TRUE TRACK</dt><dd>${trackDeg}</dd>
+      <dt>GROUND SPEED</dt><dd>${Math.round(motion.velocity)} m/s</dd>
+      <dt>TRACK</dt><dd>${trackDeg}</dd>
       <dt>VERTICAL RATE</dt><dd>${motion.verticalRate.toFixed(1)} m/s</dd>
-      <dt>LAT / LON</dt><dd>${motion.latitude.toFixed(4)}° / ${motion.longitude.toFixed(4)}°</dd>
-      <dt>DISPLAY SPEED</dt><dd>${motion.screenSpeedPxPerSec.toFixed(1)} px/s (M×${motion.motionMultiplier.toFixed(1)})</dd>
-      <dt>ESTIMATED LEAD</dt><dd>${motion.screenLeadPx.toFixed(1)} px (${motion.truthErrorKm.toFixed(1)} km)</dd>
-      <dt>OBSERVATION AGE</dt><dd>${formatAge(Date.now() / 1000 - truth.positionTime)}</dd>
+      <dt>OBSERVED</dt><dd>${formatAge(Date.now() / 1000 - truth.positionTime)} ago</dd>
     </dl>
     <button id="track-aircraft-btn" class="track-btn ${isTrackingAircraft ? 'active' : ''}">
       ${isTrackingAircraft ? '✓ TRACKING AIRCRAFT' : 'TRACK AIRCRAFT'}
@@ -1351,8 +1458,8 @@ function updateSatellites() {
       selectedSatGlyph.lookAt(camera.position);
 
       const satDist = pos.distanceTo(camera.position);
-      const haloScale = getWorldScaleForPixelSize(camera, satDist, 11.5, viewportHeight);
-      selectedSatHalo.scale.setScalar(haloScale / 0.055);
+      const bracketScale = getWorldScaleForPixelSize(camera, satDist, 16.0, viewportHeight);
+      selectedSatHalo.scale.setScalar(bracketScale);
       const glyphScale = getWorldScaleForPixelSize(camera, satDist, 9.5, viewportHeight);
       selectedSatGlyph.scale.setScalar(glyphScale);
     }
@@ -1387,10 +1494,23 @@ function drawOrbit(index: number) {
       points.push(eciVector(propagated.position as satellite.EciVec3<number>));
     }
   }
-  orbitLine = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(points),
-    new THREE.LineBasicMaterial({ color: 0x54abdf, transparent: true, opacity: 0.40, depthWrite: false, depthTest: true })
+  const orbitGeometry = new THREE.BufferGeometry().setFromPoints(points);
+  const fullOrbit = new THREE.Line(
+    orbitGeometry,
+    new THREE.LineDashedMaterial({ color: 0x5797b7, transparent: true, opacity: 0.15, dashSize: 0.018, gapSize: 0.055, depthWrite: false, depthTest: true })
   );
+  fullOrbit.computeLineDistances();
+
+  const midpoint = Math.floor(points.length / 2);
+  const nearPoints = points.slice(Math.max(0, midpoint - 12), Math.min(points.length, midpoint + 13));
+  const nearOrbit = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(nearPoints),
+    new THREE.LineDashedMaterial({ color: 0x75bdd8, transparent: true, opacity: 0.40, dashSize: 0.022, gapSize: 0.048, depthWrite: false, depthTest: true })
+  );
+  nearOrbit.computeLineDistances();
+
+  orbitLine = new THREE.Group();
+  orbitLine.add(fullOrbit, nearOrbit);
   equatorialFrame.add(orbitLine);
 }
 
@@ -1407,6 +1527,7 @@ function selectSatellite(index: number) {
   drawOrbit(index);
   selectedSatHalo.visible = true;
   selectedSatGlyph.visible = true;
+  $('#status-drawer').style.opacity = '0';
   updateSatelliteInspector(new Date());
 }
 
@@ -1436,18 +1557,17 @@ function updateSatelliteInspector(now: Date) {
   $('#inspector').hidden = false;
   $('#inspector').innerHTML = `
     <div class="inspector-header">
-      <h2>${escapeHtml(item.name)}</h2>
-      <span class="type-badge">SATELLITE · NORAD ${escapeHtml(item.norad)}</span>
+      <div><span class="inspector-kicker">SATELLITE</span><h2>${escapeHtml(item.name)}</h2><span class="inspector-id">NORAD ${escapeHtml(item.norad)}</span></div>
+      <span class="type-badge">SGP4</span>
     </div>
     <dl class="inspector-grid">
-      <dt>OBJECT NAME</dt><dd>${escapeHtml(item.name)}</dd>
-      <dt>NORAD ID</dt><dd>${escapeHtml(item.norad)}</dd>
       <dt>ALTITUDE</dt><dd>${Math.round(geodetic.height)} km</dd>
-      <dt>SPEED</dt><dd>${spd.toFixed(2)} km/s</dd>
-      <dt>ORBITAL PERIOD</dt><dd>${periodMin.toFixed(1)} min</dd>
-      <dt>LAT / LON</dt><dd>${THREE.MathUtils.radToDeg(geodetic.latitude).toFixed(4)}° / ${THREE.MathUtils.radToDeg(geodetic.longitude).toFixed(4)}°</dd>
-      <dt>EPOCH</dt><dd>${utc(item.epoch)}</dd>
-      <dt>CATALOG AGE</dt><dd>${formatAge((Date.now() - elementsRetrievedAt) / 1000)}</dd>
+      <dt>VELOCITY</dt><dd>${spd.toFixed(2)} km/s</dd>
+      <dt>INCLINATION</dt><dd>${THREE.MathUtils.radToDeg(item.satrec.inclo).toFixed(2)}°</dd>
+      <dt>PERIOD</dt><dd>${periodMin.toFixed(1)} min</dd>
+      <dt>ELEMENT EPOCH</dt><dd>${utc(item.epoch)}</dd>
+      <dt>RETRIEVED</dt><dd>${formatAge((Date.now() - elementsRetrievedAt) / 1000)} ago</dd>
+      <dt>SOURCE</dt><dd>CELESTRAK</dd>
     </dl>
   `;
 }
@@ -1499,19 +1619,33 @@ function updateMotionDebugPanel() {
   const devLonStr = deviceLon !== null ? `${deviceLon.toFixed(4)}°` : '—';
 
   const q = currentEarthOrientation.quaternion;
-  const qStr = `${q.x.toFixed(3)}, ${q.y.toFixed(3)}, ${q.z.toFixed(3)}, ${q.w.toFixed(3)}`;
+  const qStr = `${q.x.toFixed(4)}, ${q.y.toFixed(4)}, ${q.z.toFixed(4)}, ${q.w.toFixed(4)}`;
+  const cameraQ = camera.quaternion;
+  const cameraQStr = `${cameraQ.x.toFixed(4)}, ${cameraQ.y.toFixed(4)}, ${cameraQ.z.toFixed(4)}, ${cameraQ.w.toFixed(4)}`;
+  const probeText = (label: string) => {
+    const probe = landmarkProbes.find((entry) => entry.label === label)!;
+    return `${probe.screen.x.toFixed(1)}, ${probe.screen.y.toFixed(1)} · Δ${probe.deltaPx.toFixed(2)}px`;
+  };
 
   metricsEl.innerHTML = `
     <dt>FPS</dt><dd>${currentFps}</dd>
     <dt>UTC</dt><dd>${utc(new Date())}</dd>
-    <dt>GMST RAD / DEG</dt><dd>${currentEarthOrientation.gmstRad.toFixed(4)} / ${currentEarthOrientation.gmstDeg.toFixed(1)}°</dd>
-    <dt>EARTH ROT ANGLE</dt><dd>${currentEarthOrientation.rotAngleDeg.toFixed(2)}°</dd>
+    <dt>EARTH VISUAL UTC</dt><dd>${utc(new Date(earthSimulationTimeMs(Date.now())))}</dd>
+    <dt>EARTH RATE</dt><dd>${earthRealtimeReconciliation ? '1× · SYNCING' : `${earthTimeScale}×${earthTimeScale === 1 ? ' · REALTIME' : ' · VISUAL'}`}</dd>
+    <dt>GMST</dt><dd>${currentEarthOrientation.gmstDeg.toFixed(4)}°</dd>
+    <dt>GMST DELTA / ELAPSED</dt><dd>${gmstDeltaDeg.toFixed(5)}° / ${landmarkProbeElapsedSec.toFixed(1)}s</dd>
+    <dt>EARTH ROT ANGLE</dt><dd>${currentEarthOrientation.rotAngleDeg.toFixed(4)}°</dd>
     <dt>EARTH FIXED QUAT</dt><dd>${qStr}</dd>
     <div class="debug-divider"></div>
     <dt>CAMERA MODE</dt><dd>${cameraMode}</dd>
     <dt>CAMERA DISTANCE</dt><dd>${cameraDist.toFixed(2)} Earth Radii</dd>
+    <dt>CAMERA WORLD POS</dt><dd>(${camera.position.x.toFixed(3)}, ${camera.position.y.toFixed(3)}, ${camera.position.z.toFixed(3)})</dd>
+    <dt>CAMERA QUAT</dt><dd>${cameraQStr}</dd>
     <dt>CONTROLS TARGET</dt><dd>(${controls.target.x.toFixed(1)}, ${controls.target.y.toFixed(1)}, ${controls.target.z.toFixed(1)})</dd>
     <dt>DEVICE LAT / LON</dt><dd>${devLatStr} / ${devLonStr}</dd>
+    <dt>GREENWICH SCREEN X/Y</dt><dd>${probeText('GREENWICH')}</dd>
+    <dt>INDIA SCREEN X/Y</dt><dd>${probeText('INDIA')}</dd>
+    <dt>JAPAN SCREEN X/Y</dt><dd>${probeText('JAPAN')}</dd>
     <div class="debug-divider"></div>
     <dt>SAT CATALOG COUNT</dt><dd>${catalogCount.toLocaleString()}</dd>
     <dt>SAT VALID / PROPAGATED</dt><dd>${orbiters.length.toLocaleString()} / ${satGlyphsMesh.count.toLocaleString()}</dd>
@@ -1529,6 +1663,7 @@ function updateMotionDebugPanel() {
     <dt>AIR LABELS</dt><dd>${visibleLabels.toLocaleString()} PLACED</dd>
     <dt>HOVER TYPE / ID</dt><dd>${hoveredIcao ? `AIRCRAFT / ${escapeHtml(hoveredIcao)}` : hoveredSatelliteNorad ? `SATELLITE / ${escapeHtml(hoveredSatelliteNorad)}` : 'NONE'}</dd>
     <dt>SELECTED TYPE / ID</dt><dd>${selectedAircraftIcao ? `AIRCRAFT / ${escapeHtml(selectedAircraftIcao)}` : selectedSatelliteNorad ? `SATELLITE / ${escapeHtml(selectedSatelliteNorad)}` : 'NONE'}</dd>
+    <dt>TRACKING</dt><dd>${cameraMode === 'TRACKING' ? 'YES' : 'NO'}</dd>
     <dt>LAST PICK DISTANCE</dt><dd>${lastPickDistancePx === null ? '—' : `${lastPickDistancePx.toFixed(1)} px`}</dd>
     <dt>SAT 5S SCREEN DELTA</dt><dd>${satelliteMotionProbe?.deltaPx?.toFixed(2) ?? 'sampling'} px</dd>
   `;
@@ -1565,6 +1700,7 @@ function clearSelection() {
   orbitLine?.removeFromParent();
   orbitLine = undefined;
   $('#inspector').hidden = true;
+  $('#status-drawer').style.opacity = '1';
 }
 
 canvas.addEventListener('pointermove', (event) => {
@@ -1583,14 +1719,14 @@ canvas.addEventListener('pointermove', (event) => {
     lastHitAirCallsign = (motion.truth.callsign || motion.truth.icao24).trim();
     lastHitAirTier = motion.lodTier;
     lastHitAirInstanceId = motion.truth.icao24;
-    tooltipEl.innerHTML = `<div class="title">✈ ${escapeHtml(lastHitAirCallsign)}</div><div class="meta">ALT ${(motion.altitude / 1000).toFixed(1)} km · SPEED ${Math.round(motion.velocity)} m/s</div>`;
+    tooltipEl.innerHTML = `<div class="title">${escapeHtml(lastHitAirCallsign)}</div><div class="meta">ALT ${(motion.altitude / 1000).toFixed(1)} km · SPEED ${Math.round(motion.velocity)} m/s</div>`;
   } else {
     const orbiter = orbiters[hit.value.index];
     if (!orbiter) return;
     hoveredSatelliteNorad = orbiter.norad;
     lastHitSatName = orbiter.name;
     lastHitSatInstanceId = orbiter.norad;
-    tooltipEl.innerHTML = `<div class="title">🛰 ${escapeHtml(orbiter.name)}</div><div class="meta">NORAD ${escapeHtml(orbiter.norad)}</div>`;
+    tooltipEl.innerHTML = `<div class="title">${escapeHtml(orbiter.name)}</div><div class="meta">NORAD ${escapeHtml(orbiter.norad)}</div>`;
   }
 });
 
@@ -1598,11 +1734,27 @@ canvas.addEventListener('pointerup', (event) => {
   if (Math.hypot(event.clientX - pointerDownX, event.clientY - pointerDownY) > 6) return;
   const hit = nearestCandidate(event);
   if (!hit) { clearSelection(); return; }
-  if (hit.type === 'aircraft') selectAircraft(hit.value.index);
-  else selectSatellite(hit.value.index);
+  $('#hover-tooltip').hidden = true;
+  if (hit.type === 'aircraft') {
+    hoveredIcao = null;
+    selectAircraft(hit.value.index);
+  } else {
+    hoveredSatelliteNorad = null;
+    selectSatellite(hit.value.index);
+  }
 });
 
 // Control Handlers
+document.querySelectorAll<HTMLButtonElement>('.earth-rate-btn').forEach((button) => {
+  button.addEventListener('click', () => {
+    const scaleValue = Number(button.dataset.earthRate);
+    if (scaleValue === 1 || scaleValue === 60 || scaleValue === 240) {
+      setEarthTimeScale(scaleValue);
+    }
+  });
+});
+updateEarthRateControl();
+
 $('#locate').addEventListener('click', locate);
 
 $('#toggle-satellites').addEventListener('click', (event) => {
@@ -1669,6 +1821,10 @@ $('#close-debug').addEventListener('click', () => {
 
 // Keyboard Diagnostics Overlay ('M' or 'D' Key)
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    clearSelection();
+    return;
+  }
   if (e.key.toLowerCase() === 'm' || e.key.toLowerCase() === 'd') {
     const panel = $('#motion-debug-panel');
     panel.hidden = !panel.hidden;
@@ -1797,7 +1953,8 @@ function render(now: number) {
   }
 
   // 1. Authoritative Earth Orientation Update at top of frame loop
-  updateEarthOrientation(nowDate);
+  const earthOrientationDate = new Date(earthSimulationTimeMs(nowDate.getTime()));
+  updateEarthOrientation(earthOrientationDate);
 
   // 2. Camera animation slerp (if locating)
   if (cameraMode === 'LOCATING' && locateAnim) {
@@ -1829,6 +1986,7 @@ function render(now: number) {
   // 3. Object & Beacon Updates
   updateSatellites();
   updateAircraftPositions();
+  updateLandmarkProbes(nowDate.getTime() / 1000);
   updateMotionProbes(nowDate.getTime() / 1000);
   updateObserverBeacon(nowSeconds);
 

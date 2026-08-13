@@ -3,10 +3,10 @@ credentials.json
 .secrets/
 .env
 .env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Generated output
 dist/
 node_modules/
 *.tsbuildinfo
-
