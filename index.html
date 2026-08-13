@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="description" content="VECTOR — Real-time planetary situational visualization instrument of Earth, satellite orbits, and global aircraft motion." />
+  <title>VECTOR — Earth, in motion.</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='none' stroke='%23b5d8e5' stroke-width='6'/></svg>" />
+</head>
+<body>
+  <canvas id="vector-canvas" aria-label="Interactive Earth situational visualization console"></canvas>
+
+  <div id="app">
+    <!-- Top-Left Masthead -->
+    <header class="masthead">
+      <div class="brand-row">
+        <h1>VECTOR</h1>
+        <span class="tagline">Earth, in motion.</span>
+      </div>
+      <div class="sub-tag">FORESIGHT LABS / EXP. 01</div>
+    </header>
+
+    <!-- Top-Right UTC Instrument Clock -->
+    <section class="clock" aria-label="Current UTC time">
+      <time id="utc">00:00:00 UTC</time>
+      <span class="label">COORDINATED UNIVERSAL TIME</span>
+    </section>
+
+    <!-- Right-Middle Telemetric Status Drawer -->
+    <aside id="status-drawer" class="status-drawer" aria-label="System status telemetry">
+      <div class="status-block">
+        <span class="label">ORBITAL PROPAGATION</span>
+        <span id="satellite-status" class="value">SGP4 INITIALIZING</span>
+        <span id="satellite-meta" class="meta">CELESTRAK GP · 2-HOUR CACHE</span>
+      </div>
+      <div class="status-block">
+        <span class="label">AERIAL OBSERVATIONS</span>
+        <span id="aircraft-status" class="value">ADS-B INITIALIZING</span>
+        <span id="aircraft-meta" class="meta">OPENSKY NETWORK</span>
+      </div>
+      <div id="motion-badge-block" class="status-block" hidden>
+        <span class="label">MOTION VISUALIZATION</span>
+        <span id="motion-badge-val" class="value">MOTION ×1</span>
+        <span id="motion-badge-meta" class="meta">ADAPTIVE SCREEN SCALE</span>
+      </div>
+      <div class="status-block">
+        <span class="label">SCREEN LOD DENSITY</span>
+        <span id="lod-counts-val" class="value">0 OBS · 0 DETAILED</span>
+        <span id="lod-counts-meta" class="meta">SPATIAL BUCKETING GRID</span>
+      </div>
+      <div class="status-block">
+        <span class="label">PLANETARY ROTATION</span>
+        <span class="value">UTC / GMST</span>
+        <span class="meta">OBLIQUITY 23.439°</span>
+      </div>
+      <div class="status-block">
+        <span class="label">OBSERVER BEACON</span>
+        <span id="observer-status" class="value">NOT GEOLOCATED</span>
+        <span id="observer-meta" class="meta">BROWSER GEOLOCATION</span>
+      </div>
+    </aside>
+
+    <!-- Aircraft Screen-Space Label Overlay Container -->
+    <div id="labels-container" class="labels-container" aria-hidden="true"></div>
+
+    <!-- Object Hover Telemetry Tooltip -->
+    <div id="hover-tooltip" class="hover-tooltip" hidden></div>
+
+    <!-- Motion Instrumentation Diagnostic Overlay -->
+    <div id="motion-debug-panel" class="motion-debug-panel" hidden>
+      <div class="debug-header">
+        <span>MOTION DIAGNOSTICS</span>
+        <button id="close-debug" class="close-debug-btn">✕</button>
+      </div>
+      <dl id="debug-metrics"></dl>
+    </div>
+
+    <!-- Bottom-Left Telemetry Counters -->
+    <div class="telemetry-hud" aria-label="Live count summary">
+      <div class="telemetry-item">
+        <span class="key">SAT</span>
+        <span id="sat-count" class="val">0</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="key">AIR</span>
+        <span id="air-count" class="val">0</span>
+      </div>
+      <div class="telemetry-divider"></div>
+      <div class="telemetry-item">
+        <span class="key">FRAME</span>
+        <span class="val">ECEF / ECI</span>
+      </div>
+    </div>
+
+    <!-- Bottom-Right Precision Control Toolbar -->
+    <nav class="controls-toolbar" aria-label="Visualization controls">
+      <button id="locate" class="control-btn interactive" title="Locate observer position">
+        <svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+        <span>Locate</span>
+      </button>
+      <button id="toggle-satellites" class="control-btn interactive active" aria-pressed="true" title="Toggle satellite orbits">
+        <span>Satellites</span>
+      </button>
+      <button id="toggle-aircraft" class="control-btn interactive active" aria-pressed="true" title="Toggle aircraft flights">
+        <span>Aircraft</span>
+      </button>
+      <button id="reset-view" class="control-btn interactive" title="Reset camera composition">
+        <span>Reset</span>
+      </button>
+      <button id="about" class="control-btn interactive" title="About VECTOR and data credits">
+        <span>About</span>
+      </button>
+    </nav>
+
+    <!-- Floating Object Telemetry Inspector -->
+    <aside id="inspector" class="inspector" aria-live="polite" hidden></aside>
+
+    <!-- About / Credits Modal Panel -->
+    <aside id="about-panel" class="about-panel" aria-labelledby="about-heading" hidden>
+      <button id="close-about" class="close-btn interactive" aria-label="Close about modal">✕</button>
+      
+      <p class="eyebrow">ASTRONOMICAL & GEOSPATIAL INSTRUMENT</p>
+      <h2 id="about-heading">VECTOR</h2>
+      <p class="about-tagline">Earth, in motion.</p>
+      
+      <p>VECTOR is an independent real-time planetary situational visualization. It renders high-fidelity satellite trajectories and live commercial aviation state vectors on a mathematically accurate Earth model oriented by UTC GMST.</p>
+      
+      <div class="creator-badge">
+        <strong>Designed &amp; developed by Hrik</strong><br />
+        <small>A Foresight Labs experiment</small>
+      </div>
+
+      <p class="eyebrow" style="margin-top: 16px;">DATA & ATTRIBUTION SOURCES</p>
+      <dl class="credits-grid">
+        <dt>Satellite Orbital Data</dt>
+        <dd><a href="https://celestrak.org/" target="_blank" rel="noreferrer">CelesTrak GP</a></dd>
+        
+        <dt>Aircraft Observations</dt>
+        <dd><a href="https://opensky-network.org/" target="_blank" rel="noreferrer">OpenSky Network</a></dd>
+        
+        <dt>Geographic Reference</dt>
+        <dd><a href="https://www.naturalearthdata.com/" target="_blank" rel="noreferrer">Natural Earth 1:50m</a></dd>
+        
+        <dt>Orbital Propagation</dt>
+        <dd><a href="https://github.com/shashwatak/satellite-js" target="_blank" rel="noreferrer">Satellite.js / SGP4</a></dd>
+      </dl>
+
+      <div class="legal-disclaimer">
+        VECTOR is designed for scientific, educational, and portfolio purposes. Satellite positions are propagated in real time from published orbital element sets. Aircraft vectors represent crowdsourced ADS-B observations and may be delayed or regionalized.
+      </div>
+
+      <div class="copyright-notice">
+        © 2026 Hrik. All rights reserved.
+        <small>Applies to original code, visual design, shaders, telemetry interface, and original branding.</small>
+      </div>
+    </aside>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

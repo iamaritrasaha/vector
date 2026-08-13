@@ -1,0 +1,12 @@
+# Private credentials and local environment
+credentials.json
+.secrets/
+.env
+.env.local
+.env.*.local
+
+# Generated output
+dist/
+node_modules/
+*.tsbuildinfo
+

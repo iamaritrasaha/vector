@@ -1,0 +1,40 @@
+/* Additional micro-status utilities & custom scrollbars for VECTOR */
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(160, 195, 215, 0.2);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(190, 225, 245, 0.4);
+}
+
+.beacon-dot {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: var(--text-accent);
+  box-shadow: 0 0 6px var(--text-accent);
+}
+
+.status-badge-ok {
+  color: var(--text-accent);
+}
+
+.status-badge-warn {
+  color: #e5ad67;
+}
+
+.status-badge-err {
+  color: #e56767;
+}
