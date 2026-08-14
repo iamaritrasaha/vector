@@ -694,6 +694,29 @@ button {
   z-index: 8;
 }
 
+.ref-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  color: #a2cce0;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.95), 0 0 5px rgba(0, 0, 0, 0.85);
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  transition: opacity 0.15s ease;
+  z-index: 7;
+}
+
+.ref-label.tilt-angle {
+  font-size: 9px;
+  color: #7bb5cc;
+  letter-spacing: 0.06em;
+}
+
 /* TRACK BUTTON IN INSPECTOR */
 .track-btn {
   margin-top: 12px;

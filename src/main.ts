@@ -191,6 +191,41 @@ controls.minDistance = 4.6;
 controls.maxDistance = 38.0;
 controls.target.set(0, 0, 0);
 
+/**
+ * Smoothly zoom-adaptive OrbitControls sensitivity and damping.
+ * Derives rotateSpeed and dampingFactor from camera distance / altitude above Earth.
+ * Targets:
+ * - GLOBAL (d in [18.0, 38.0]): rotateSpeed 0.72 - 0.88, dampingFactor 0.06
+ * - CONTINENTAL (d in [9.5, 18.0]): rotateSpeed 0.45 - 0.72, dampingFactor 0.068 - 0.06
+ * - REGIONAL (d in [6.0, 9.5]): rotateSpeed 0.22 - 0.45, dampingFactor 0.08 - 0.068
+ * - CLOSE (d in [4.6, 6.0]): rotateSpeed 0.10 - 0.22, dampingFactor 0.10 - 0.08 (crisp stopping without overshoot)
+ */
+function computeAdaptiveControlsSensitivity(cameraDist: number): { rotateSpeed: number; dampingFactor: number } {
+  const d = THREE.MathUtils.clamp(cameraDist, 4.6, 38.0);
+  let rotateSpeed: number;
+  let dampingFactor: number;
+
+  if (d <= 6.0) {
+    const t = THREE.MathUtils.smoothstep(d, 4.6, 6.0);
+    rotateSpeed = THREE.MathUtils.lerp(0.10, 0.22, t);
+    dampingFactor = THREE.MathUtils.lerp(0.10, 0.08, t);
+  } else if (d <= 9.5) {
+    const t = THREE.MathUtils.smoothstep(d, 6.0, 9.5);
+    rotateSpeed = THREE.MathUtils.lerp(0.22, 0.45, t);
+    dampingFactor = THREE.MathUtils.lerp(0.08, 0.068, t);
+  } else if (d <= 18.0) {
+    const t = THREE.MathUtils.smoothstep(d, 9.5, 18.0);
+    rotateSpeed = THREE.MathUtils.lerp(0.45, 0.72, t);
+    dampingFactor = THREE.MathUtils.lerp(0.068, 0.06, t);
+  } else {
+    const t = THREE.MathUtils.smoothstep(d, 18.0, 38.0);
+    rotateSpeed = THREE.MathUtils.lerp(0.72, 0.88, t);
+    dampingFactor = 0.06;
+  }
+
+  return { rotateSpeed, dampingFactor };
+}
+
 // Pointer Interaction Tracking (Distinguishes clicks from camera orbit drags)
 let pointerDownX = 0;
 let pointerDownY = 0;
@@ -377,69 +412,21 @@ earth.add(earthReferenceCircle(0, 0, true));
 // Restrained Astronomical Reference Instrument
 const instrumentGroup = new THREE.Group();
 
-// 1. Hairline Polar Rotation Axis with Precision Reticle Ticks
-const axisSegments: number[] = [
-  // Polar shaft through Earth's rotational axis
-  0, -4.52, 0,  0, 4.52, 0,
-  // North pole reticle cross-tick
-  -0.06, 4.52, 0,  0.06, 4.52, 0,
-  0, 4.52, -0.06,  0, 4.52, 0.06,
-  // North secondary sub-tick
-  -0.03, 4.25, 0,  0.03, 4.25, 0,
-  0, 4.25, -0.03,  0, 4.25, 0.03,
-  // South pole reticle cross-tick
-  -0.06, -4.52, 0,  0.06, -4.52, 0,
-  0, -4.52, -0.06,  0, -4.52, 0.06,
-  // South secondary sub-tick
-  -0.03, -4.25, 0,  0.03, -4.25, 0,
-  0, -4.25, -0.03,  0, -4.25, 0.03,
+// 1. Hairline Polar Rotation Axis with Clean Terminal Ticks
+const axisSegments = [
+  // Rotational axis shaft through Earth's geographic poles (Earth radius = 4.0, extent = 4.40)
+  0, -4.40, 0,  0, 4.40, 0,
+  // North pole terminal tick
+  -0.03, 4.40, 0,  0.03, 4.40, 0,
+  // South pole terminal tick
+  -0.03, -4.40, 0,  0.03, -4.40, 0,
 ];
 const axisGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(axisSegments, 3));
 const axisMat = new THREE.LineBasicMaterial({ color: 0x7eb0c8, transparent: true, opacity: 0.24, depthWrite: false });
-instrumentGroup.add(new THREE.LineSegments(axisGeo, axisMat));
+const axisLine = new THREE.LineSegments(axisGeo, axisMat);
+instrumentGroup.add(axisLine);
 
-// 2. Subtle Equatorial Reference Ring Floating Outside Surface
-const eqRingRadius = 4.18;
-const eqRingPts: THREE.Vector3[] = [];
-for (let i = 0; i <= 128; i++) {
-  const theta = (i / 128) * Math.PI * 2;
-  eqRingPts.push(new THREE.Vector3(eqRingRadius * Math.cos(theta), 0, eqRingRadius * Math.sin(theta)));
-}
-const eqRingGeo = new THREE.BufferGeometry().setFromPoints(eqRingPts);
-const eqRingMat = new THREE.LineBasicMaterial({ color: 0x5a889f, transparent: true, opacity: 0.18, depthWrite: false });
-instrumentGroup.add(new THREE.Line(eqRingGeo, eqRingMat));
-
-// Equatorial Cardinal & 30° Subdivision Hairline Ticks
-const eqTicksPoints: number[] = [];
-for (let deg = 0; deg < 360; deg += 30) {
-  const rad = deg * (Math.PI / 180);
-  const isCardinal = deg % 90 === 0;
-  const tickLen = isCardinal ? 0.08 : 0.035;
-  const r1 = eqRingRadius - 0.01;
-  const r2 = eqRingRadius + tickLen;
-  const cos = Math.cos(rad);
-  const sin = Math.sin(rad);
-  eqTicksPoints.push(r1 * cos, 0, r1 * sin, r2 * cos, 0, r2 * sin);
-}
-const eqTicksGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(eqTicksPoints, 3));
-const eqTicksMat = new THREE.LineBasicMaterial({ color: 0x76a7bf, transparent: true, opacity: 0.22, depthWrite: false });
-instrumentGroup.add(new THREE.LineSegments(eqTicksGeo, eqTicksMat));
-
-// 3. Ecliptic Normal Reference Guide (Normal to Orbital Plane)
-const eclipticNorm = new THREE.Vector3(-Math.sin(obliquity), Math.cos(obliquity), 0).normalize();
-const eclipticEnd = new THREE.Vector3().copy(eclipticNorm).multiplyScalar(4.52);
-const perpEcliptic = new THREE.Vector3(eclipticNorm.y, -eclipticNorm.x, 0).multiplyScalar(0.045);
-const eclipticGuidePts: THREE.Vector3[] = [
-  new THREE.Vector3(0, 4.02, 0),
-  eclipticEnd,
-  eclipticEnd.clone().sub(perpEcliptic),
-  eclipticEnd.clone().add(perpEcliptic),
-];
-const eclipticGuideGeo = new THREE.BufferGeometry().setFromPoints(eclipticGuidePts);
-const eclipticGuideMat = new THREE.LineBasicMaterial({ color: 0x487085, transparent: true, opacity: 0.20, depthWrite: false });
-instrumentGroup.add(new THREE.LineSegments(eclipticGuideGeo, eclipticGuideMat));
-
-// Subtle Ecliptic Reference Plane Ring
+// 2. Subtle Ecliptic Reference Plane Ring (Inertial Reference Ring)
 const eclipticRingPts: THREE.Vector3[] = [];
 for (let i = 0; i <= 128; i++) {
   const theta = (i / 128) * Math.PI * 2;
@@ -452,90 +439,42 @@ const eclipticRingGeo = new THREE.BufferGeometry().setFromPoints(eclipticRingPts
 const eclipticRingMat = new THREE.LineDashedMaterial({
   color: 0x3d6377,
   transparent: true,
-  opacity: 0.10,
-  dashSize: 0.08,
-  gapSize: 0.10,
+  opacity: 0.08,
+  dashSize: 0.06,
+  gapSize: 0.08,
   depthWrite: false,
 });
 const eclipticRingLine = new THREE.Line(eclipticRingGeo, eclipticRingMat);
 eclipticRingLine.computeLineDistances();
 instrumentGroup.add(eclipticRingLine);
 
-// 4. Precision 23.439° Axial Tilt Arc
+// 3. Short Local Ecliptic Normal Guide & 23.44° Axial Tilt Arc
+const eclipticNorm = new THREE.Vector3(-Math.sin(obliquity), Math.cos(obliquity), 0).normalize();
+const eclNormStart = eclipticNorm.clone().multiplyScalar(4.12);
+const eclNormEnd = eclipticNorm.clone().multiplyScalar(4.40);
+const eclPerp = new THREE.Vector3(eclipticNorm.y, -eclipticNorm.x, 0).multiplyScalar(0.025);
+const eclipticGuidePts = [
+  eclNormStart.x, eclNormStart.y, eclNormStart.z,  eclNormEnd.x, eclNormEnd.y, eclNormEnd.z,
+  eclNormEnd.x - eclPerp.x, eclNormEnd.y - eclPerp.y, eclNormEnd.z,  eclNormEnd.x + eclPerp.x, eclNormEnd.y + eclPerp.y, eclNormEnd.z,
+];
+const eclipticGuideGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(eclipticGuidePts, 3));
+const eclipticNormalMat = new THREE.LineBasicMaterial({ color: 0x487085, transparent: true, opacity: 0.20, depthWrite: false });
+const eclipticNormalLine = new THREE.LineSegments(eclipticGuideGeo, eclipticNormalMat);
+instrumentGroup.add(eclipticNormalLine);
+
+// Precision 23.44° Axial Tilt Arc
 const tiltArcPts: THREE.Vector3[] = [];
-const tiltRadius = 4.36;
+const tiltRadius = 4.28;
 for (let i = 0; i <= 24; i++) {
   const angle = (i / 24) * obliquity;
   tiltArcPts.push(new THREE.Vector3(-tiltRadius * Math.sin(angle), tiltRadius * Math.cos(angle), 0));
 }
 const tiltGeo = new THREE.BufferGeometry().setFromPoints(tiltArcPts);
-const tiltMat = new THREE.LineBasicMaterial({ color: 0x7cb2cc, transparent: true, opacity: 0.30, depthWrite: false });
-instrumentGroup.add(new THREE.Line(tiltGeo, tiltMat));
+const tiltMat = new THREE.LineBasicMaterial({ color: 0x7cb2cc, transparent: true, opacity: 0.28, depthWrite: false });
+const tiltArcLine = new THREE.Line(tiltGeo, tiltMat);
+instrumentGroup.add(tiltArcLine);
 
 equatorialFrame.add(instrumentGroup);
-
-// Degree & Grid Labels
-type DegreeLabelTier = 'ANCHOR' | 'MAJOR' | 'MINOR';
-interface TieredDegreeLabel {
-  sprite: THREE.Sprite;
-  tier: DegreeLabelTier;
-  material: THREE.SpriteMaterial;
-  isTiltText?: boolean;
-}
-const degreeLabels: TieredDegreeLabel[] = [];
-
-function makeLabel(text: string, position: THREE.Vector3, tier: DegreeLabelTier = 'MAJOR', isTiltText = false) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 80;
-  const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 256, 80);
-
-  ctx.font = '500 24px "DM Mono", "Roboto Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = tier === 'ANCHOR' ? '#a5d0e6' : tier === 'MAJOR' ? '#78a6bc' : '#578196';
-  ctx.fillText(text, 128, 40);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.minFilter = THREE.LinearFilter;
-
-  const baseOpacity = tier === 'ANCHOR' ? 0.38 : tier === 'MAJOR' ? 0.24 : 0.16;
-  const spriteMaterial = new THREE.SpriteMaterial({
-    map: texture,
-    transparent: true,
-    opacity: baseOpacity,
-    depthWrite: false,
-  });
-  const sprite = new THREE.Sprite(spriteMaterial);
-  sprite.position.copy(position);
-
-  const baseScale = tier === 'ANCHOR' ? 0.26 : tier === 'MAJOR' ? 0.20 : 0.16;
-  sprite.scale.set(baseScale, baseScale * (80 / 256), 1);
-
-  if (isTiltText) {
-    instrumentGroup.add(sprite);
-  } else {
-    earth.add(sprite);
-  }
-  degreeLabels.push({ sprite, tier, material: spriteMaterial, isTiltText });
-}
-
-makeLabel('N', new THREE.Vector3(0, 4.60, 0), 'ANCHOR', true);
-makeLabel('S', new THREE.Vector3(0, -4.60, 0), 'ANCHOR', true);
-makeLabel('23.439°', new THREE.Vector3(-Math.sin(obliquity * 0.5) * 4.46, Math.cos(obliquity * 0.5) * 4.46, 0), 'ANCHOR', true);
-makeLabel('EQ', latLonToVector3(0, 0, 4.05), 'ANCHOR');
-makeLabel('PM', latLonToVector3(0, 0, 4.05), 'ANCHOR');
-
-for (const lat of [-60, -30, 30, 60]) {
-  makeLabel(`${Math.abs(lat)}°${lat > 0 ? 'N' : 'S'}`, latLonToVector3(lat, 0, 4.05), 'MAJOR');
-}
-for (const lon of [-90, 90, 180]) {
-  makeLabel(`${Math.abs(lon)}°${lon > 0 ? 'E' : lon < 0 ? 'W' : ''}`, latLonToVector3(0, lon, 4.05), 'MAJOR');
-}
-for (const lon of [-150, -120, -60, -30, 30, 60, 120, 150]) {
-  makeLabel(`${Math.abs(lon)}°${lon > 0 ? 'E' : 'W'}`, latLonToVector3(0, lon, 4.05), 'MINOR');
-}
 
 // Satellite Layer State & Instanced Mesh Mappings
 type OmmElement = Parameters<typeof satellite.json2satrec>[0];
@@ -581,6 +520,22 @@ selectedSatHalo.visible = false;
 equatorialFrame.add(selectedSatHalo);
 
 let orbitLine: THREE.Group | undefined;
+
+function clearOrbit() {
+  if (!orbitLine) return;
+  orbitLine.traverse((child) => {
+    if (child instanceof THREE.Line || child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
+      child.geometry?.dispose();
+      if (Array.isArray(child.material)) {
+        child.material.forEach((m) => m.dispose());
+      } else if (child.material) {
+        child.material.dispose();
+      }
+    }
+  });
+  orbitLine.removeFromParent();
+  orbitLine = undefined;
+}
 
 // Aircraft Layer State, Instanced Meshes & Explicit Picking Mappings
 let showAircraft = true;
@@ -659,7 +614,8 @@ const selectedAircraftHalo = createSelectionBrackets();
 selectedAircraftHalo.visible = false;
 earth.add(selectedAircraftHalo);
 
-// Core Aircraft Motion State Array
+// Core Aircraft Motion State Store (Identity-based Map) & Derived Render Array
+const aircraftStore = new Map<string, DisplayState>();
 let aircraft: DisplayState[] = [];
 let selectedAircraftIndex = -1;
 let selectedAircraftIcao: string | null = null;
@@ -672,7 +628,29 @@ let aircraftMotionProbe: MotionProbe | null = null;
 let satelliteMotionProbe: MotionProbe | null = null;
 let aircraftObservedAt = 0;
 let aircraftAvailable = false;
-let aircraftLoading = false;
+
+// Geographic Region Tile Cache & Request Queue
+interface CachedRegion {
+  key: string;
+  lat: number;
+  lon: number;
+  radiusNm: number;
+  lastFetchedAt: number;
+  status: 'idle' | 'loading' | 'success' | 'error';
+  aircraftCount: number;
+}
+
+const REGION_CACHE_TTL_MS = 28_000;
+const REGION_RADIUS_NM = 250;
+const MIN_REQUEST_INTERVAL_MS = 1100;
+const MAX_ENQUEUED_REGIONS = 8;
+
+const activeRegionsMap = new Map<string, CachedRegion>();
+const requestQueue: string[] = [];
+let isQueueProcessing = false;
+let lastRequestTimeMs = 0;
+let lastCheckedCamPos = { lat: 0, lon: 0, dist: 0 };
+let cameraMoveDebounceTimer: number | null = null;
 
 // Spatial & Label Managers
 const spatialBucketingManager = new SpatialBucketingManager(24);
@@ -764,18 +742,54 @@ function aircraftOrientation(position: THREE.Vector3, heading: number | null, si
   return target.compose(position, aircraftQuaternionTemp, aircraftScaleTemp);
 }
 
-function visibleAircraftBounds() {
+function getSubCameraCoordinates(): { lat: number; lon: number; dist: number } {
   earth.updateWorldMatrix(true, false);
   const local = earth.worldToLocal(camera.position.clone()).normalize();
-  const latitude = THREE.MathUtils.radToDeg(Math.asin(local.y));
-  const longitude = THREE.MathUtils.radToDeg(Math.atan2(local.x, local.z));
+  const clampedY = THREE.MathUtils.clamp(local.y, -1, 1);
+  const lat = THREE.MathUtils.radToDeg(Math.asin(clampedY));
+  const lon = THREE.MathUtils.radToDeg(Math.atan2(local.x, local.z));
+  const dist = camera.position.distanceTo(controls.target);
+  return { lat, lon, dist };
+}
 
-  return {
-    lamin: Math.max(-90, latitude - 14),
-    lamax: Math.min(90, latitude + 14),
-    lomin: Math.max(-180, longitude - 14),
-    lomax: Math.min(180, longitude + 14),
-  };
+function discoverVisibleRegions(): Array<{ key: string; lat: number; lon: number; distDeg: number }> {
+  const { lat: centerLat, lon: centerLon, dist } = getSubCameraCoordinates();
+
+  const altitude = Math.max(0.6, dist - earthRadius);
+  const spanDeg = THREE.MathUtils.clamp(8.0 + (altitude / 10.0) * 45.0, 8.0, 60.0);
+
+  const snappedCenterLat = Math.max(-80, Math.min(80, Math.round(centerLat / 5) * 5));
+  const snappedCenterLon = Math.max(-175, Math.min(175, Math.round(centerLon / 5) * 5));
+
+  const latStep = 5;
+  const lonStep = 5;
+  const latRange = Math.ceil(spanDeg / latStep) * latStep;
+  const lonRange = Math.ceil(spanDeg / lonStep) * lonStep;
+
+  const discovered: Array<{ key: string; lat: number; lon: number; distDeg: number }> = [];
+  const seenKeys = new Set<string>();
+
+  for (let dLat = -latRange; dLat <= latRange; dLat += latStep) {
+    const lat = Math.max(-80, Math.min(80, snappedCenterLat + dLat));
+    for (let dLon = -lonRange; dLon <= lonRange; dLon += lonStep) {
+      let lon = snappedCenterLon + dLon;
+      while (lon > 180) lon -= 360;
+      while (lon < -180) lon += 360;
+      lon = Math.max(-175, Math.min(175, Math.round(lon / 5) * 5));
+
+      const key = `${lat}:${lon}:${REGION_RADIUS_NM}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      const distDeg = greatCircleDistanceKm(centerLat, centerLon, lat, lon) / 111.12;
+      if (distDeg <= spanDeg * 1.25) {
+        discovered.push({ key, lat, lon, distDeg });
+      }
+    }
+  }
+
+  discovered.sort((a, b) => a.distDeg - b.distDeg);
+  return discovered;
 }
 
 function updateAircraftTrails(nowSeconds: number, cameraDistance: number) {
@@ -894,6 +908,34 @@ function updateAircraftPositions() {
   }
 
   const nowSeconds = Date.now() / 1000;
+
+  // Prune dead aircraft from store (age > 120s from getExtrapolationConfidence)
+  const deadIcaos: string[] = [];
+  for (const [icao, motion] of aircraftStore) {
+    const age = Math.max(0, nowSeconds - motion.anchor.positionTime);
+    const conf = getExtrapolationConfidence(age);
+    motion.confidence = conf.confidence;
+    motion.opacity = conf.opacity;
+
+    if (conf.isDead || motion.opacity <= 0) {
+      if (icao !== selectedAircraftIcao || age > 180) {
+        deadIcaos.push(icao);
+      }
+    }
+  }
+  for (const icao of deadIcaos) {
+    aircraftStore.delete(icao);
+    if (selectedAircraftIcao === icao) {
+      selectedAircraftIcao = null;
+      selectedAircraftIndex = -1;
+      isTrackingAircraft = false;
+      $('#inspector').hidden = true;
+      selectedAircraftGlyph.visible = false;
+      selectedAircraftHalo.visible = false;
+    }
+  }
+
+  aircraft = Array.from(aircraftStore.values());
   resolveSelectionIndices();
   const deltaSec = Math.min(0.1, Math.max(0.001, nowSeconds - lastFrameTimeSec));
   lastFrameTimeSec = nowSeconds;
@@ -1389,10 +1431,85 @@ function updateDomLabels(cameraDistance: number) {
   for (let i = poolIdx; i < domLabelPool.length; i++) {
     domLabelPool[i].style.display = 'none';
   }
+
+  // 5. Astronomical Reference DOM Labels (N, S, 23.44° Axial Tilt)
+  const tiltZoomFactor = THREE.MathUtils.clamp((cameraDistance - 5.5) / (12.0 - 5.5), 0, 1);
+  const axisLabelZoomFactor = THREE.MathUtils.clamp((cameraDistance - 5.0) / (10.0 - 5.0), 0, 1);
+
+  let northLabelEl = document.querySelector<HTMLElement>('#ref-label-north');
+  let southLabelEl = document.querySelector<HTMLElement>('#ref-label-south');
+  let tiltLabelEl = document.querySelector<HTMLElement>('#ref-label-tilt');
+
+  if (!northLabelEl) {
+    northLabelEl = document.createElement('div');
+    northLabelEl.id = 'ref-label-north';
+    northLabelEl.className = 'ref-label';
+    northLabelEl.textContent = 'N';
+    labelsContainer.appendChild(northLabelEl);
+  }
+  if (!southLabelEl) {
+    southLabelEl = document.createElement('div');
+    southLabelEl.id = 'ref-label-south';
+    southLabelEl.className = 'ref-label';
+    southLabelEl.textContent = 'S';
+    labelsContainer.appendChild(southLabelEl);
+  }
+  if (!tiltLabelEl) {
+    tiltLabelEl = document.createElement('div');
+    tiltLabelEl.id = 'ref-label-tilt';
+    tiltLabelEl.className = 'ref-label tilt-angle';
+    tiltLabelEl.textContent = '23.44°';
+    labelsContainer.appendChild(tiltLabelEl);
+  }
+
+  equatorialFrame.updateWorldMatrix(true, false);
+
+  // North Pole
+  const northWorld = new THREE.Vector3(0, 4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
+  const northScreen = new THREE.Vector2();
+  const northProj = projectWorldPosition(northWorld, northScreen);
+  if (northProj.visible && !isBehindEarth(northWorld) && axisLabelZoomFactor > 0.01) {
+    northLabelEl.style.display = 'block';
+    northLabelEl.style.left = `${northScreen.x}px`;
+    northLabelEl.style.top = `${northScreen.y}px`;
+    northLabelEl.style.opacity = (0.75 * axisLabelZoomFactor).toFixed(2);
+  } else {
+    northLabelEl.style.display = 'none';
+  }
+
+  // South Pole
+  const southWorld = new THREE.Vector3(0, -4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
+  const southScreen = new THREE.Vector2();
+  const southProj = projectWorldPosition(southWorld, southScreen);
+  if (southProj.visible && !isBehindEarth(southWorld) && axisLabelZoomFactor > 0.01) {
+    southLabelEl.style.display = 'block';
+    southLabelEl.style.left = `${southScreen.x}px`;
+    southLabelEl.style.top = `${southScreen.y}px`;
+    southLabelEl.style.opacity = (0.75 * axisLabelZoomFactor).toFixed(2);
+  } else {
+    southLabelEl.style.display = 'none';
+  }
+
+  // 23.44° Tilt Angle Label (midpoint of tilt arc)
+  const halfAngle = obliquity * 0.5;
+  const tiltWorld = new THREE.Vector3(-Math.sin(halfAngle) * 4.44, Math.cos(halfAngle) * 4.44, 0).applyMatrix4(equatorialFrame.matrixWorld);
+  const tiltScreen = new THREE.Vector2();
+  const tiltProj = projectWorldPosition(tiltWorld, tiltScreen);
+  if (tiltProj.visible && !isBehindEarth(tiltWorld) && tiltZoomFactor > 0.01) {
+    tiltLabelEl.style.display = 'block';
+    tiltLabelEl.style.left = `${tiltScreen.x}px`;
+    tiltLabelEl.style.top = `${tiltScreen.y}px`;
+    tiltLabelEl.style.opacity = (0.75 * tiltZoomFactor).toFixed(2);
+  } else {
+    tiltLabelEl.style.display = 'none';
+  }
 }
 
 function clearAircraftData() {
+  aircraftStore.clear();
   aircraft = [];
+  activeRegionsMap.clear();
+  requestQueue.length = 0;
   selectedAircraftIndex = -1;
   selectedAircraftIcao = null;
   isTrackingAircraft = false;
@@ -1409,8 +1526,7 @@ function selectAircraft(index: number) {
   selectedSatelliteNorad = null;
   selectedSatHalo.visible = false;
   selectedSatGlyph.visible = false;
-  orbitLine?.removeFromParent();
-  orbitLine = undefined;
+  clearOrbit();
 
   selectedAircraftIndex = index;
   selectedAircraftIcao = aircraft[index]?.truth.icao24 ?? null;
@@ -1455,139 +1571,223 @@ function updateAircraftInspector() {
   });
 }
 
-async function loadAircraft() {
-  if (aircraftLoading || !showAircraft) return;
-  aircraftLoading = true;
+function mergeAircraftPayload(payload: { provider: AircraftProvider; observedAt: number; states: TruthState[] }) {
+  const receivedAt = Date.now() / 1000;
+  aircraftObservedAt = Math.max(aircraftObservedAt, payload.observedAt);
+  aircraftProvider = payload.provider;
+  updateAircraftAttribution();
+  aircraftAvailable = true;
 
-  try {
-    const bounds = visibleAircraftBounds();
-    const query = new URLSearchParams({
-      lamin: bounds.lamin.toFixed(2),
-      lamax: bounds.lamax.toFixed(2),
-      lomin: bounds.lomin.toFixed(2),
-      lomax: bounds.lomax.toFixed(2),
-    });
+  for (const item of payload.states) {
+    const oldMotion = aircraftStore.get(item.icao24);
+    const altMeters = altitudeForTruth(item) ?? 10000;
+    const initialPos = latLonToVector3(item.latitude, item.longitude, earthRadius + (altMeters / 1000) * scale + 0.008);
 
-    const response = await fetch(`/api/aircraft?${query.toString()}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const anchor: ObservationAnchor = {
+      latitude: item.latitude,
+      longitude: item.longitude,
+      altitude: altMeters,
+      velocity: item.velocity ?? 0,
+      trueTrack: item.trueTrack ?? 0,
+      verticalRate: item.verticalRate ?? 0,
+      positionTime: item.positionTime,
+      onGround: item.onGround,
+    };
 
-    const payload = (await response.json()) as { provider: AircraftProvider; observedAt: number; states: TruthState[] };
-    aircraftApiRawCount = payload.states.length;
-    const receivedAt = Date.now() / 1000;
-    aircraftObservedAt = payload.observedAt;
-    aircraftProvider = payload.provider;
-    updateAircraftAttribution();
-    aircraftAvailable = true;
-
-    const oldMap = new Map<string, DisplayState>();
-    for (const item of aircraft) oldMap.set(item.truth.icao24, item);
-
-    const nextList: DisplayState[] = [];
-
-    for (const item of payload.states) {
-      const oldMotion = oldMap.get(item.icao24);
-      const altMeters = altitudeForTruth(item) ?? 10000;
-      const initialPos = latLonToVector3(item.latitude, item.longitude, earthRadius + (altMeters / 1000) * scale + 0.008);
-
-      const anchor: ObservationAnchor = {
+    if (!oldMotion) {
+      aircraftStore.set(item.icao24, {
+        truth: item,
+        anchor,
+        visualHeading: item.trueTrack ?? 0,
+        visualVelocity: item.velocity ?? 0,
+        visualVerticalRate: item.verticalRate ?? 0,
+        visualAltitude: altMeters,
+        accumulatedVisualLead: 0,
+        visualRate: 1.0,
+        visualLeadSeconds: 0,
         latitude: item.latitude,
         longitude: item.longitude,
         altitude: altMeters,
-        velocity: item.velocity ?? 0,
         trueTrack: item.trueTrack ?? 0,
+        velocity: item.velocity ?? 0,
         verticalRate: item.verticalRate ?? 0,
-        positionTime: item.positionTime,
-        onGround: item.onGround,
+        displayPosition: initialPos,
+        physicalPosition: { latitude: item.latitude, longitude: item.longitude, altitude: altMeters },
+        confidence: 1.0,
+        screenPos: new THREE.Vector2(),
+        targetScreenSpeedPxSec: 1.3,
+        realScreenSpeedPxPerSec: 0,
+        displayScreenSpeedPxPerSec: 0,
+        truthErrorKm: 0,
+        screenLeadPx: 0,
+        inFrustum: true,
+        facingCamera: true,
+        reconciling: false,
+        blendFromLat: item.latitude,
+        blendFromLon: item.longitude,
+        blendFromAlt: altMeters,
+        reconcileStartedAt: receivedAt,
+        reconcileDuration: 0,
+        history: [{ lat: item.latitude, lon: item.longitude, alt: altMeters, time: receivedAt, pos: initialPos.clone() }],
+        lastHistorySampleTime: receivedAt,
+        lodTier: 'TIER_B',
+        showLabel: false,
+        labelPosition: new THREE.Vector2(),
+        phase: 'OBSERVED',
+        opacity: 1.0,
+      });
+    } else if (item.positionTime > oldMotion.truth.positionTime) {
+      const distKm = greatCircleDistanceKm(oldMotion.latitude, oldMotion.longitude, item.latitude, item.longitude);
+      const isFarJump = distKm > 350.0;
+      const corrDuration = isFarJump ? 0 : Math.min(3.5, Math.max(2.0, distKm / 25.0));
+      const timeDelta = Math.max(0, item.positionTime - oldMotion.anchor.positionTime);
+      const preservedLead = Math.max(0, (oldMotion.accumulatedVisualLead ?? 0) - timeDelta);
+
+      oldMotion.truth = item;
+      oldMotion.anchor = {
+        ...anchor,
+        velocity: item.velocity ?? oldMotion.anchor.velocity,
+        trueTrack: item.trueTrack ?? oldMotion.anchor.trueTrack,
+        verticalRate: item.verticalRate ?? oldMotion.anchor.verticalRate,
       };
+      oldMotion.accumulatedVisualLead = preservedLead;
+      oldMotion.visualLeadSeconds = preservedLead;
+      oldMotion.reconciling = !isFarJump;
+      oldMotion.blendFromLat = oldMotion.latitude;
+      oldMotion.blendFromLon = oldMotion.longitude;
+      oldMotion.blendFromAlt = oldMotion.altitude;
+      oldMotion.reconcileStartedAt = receivedAt;
+      oldMotion.reconcileDuration = corrDuration;
+      oldMotion.confidence = 1.0;
+      oldMotion.phase = 'OBSERVED';
+      oldMotion.opacity = 1.0;
+    } else if (item.positionTime === oldMotion.truth.positionTime) {
+      oldMotion.truth = item;
+    }
+  }
 
-      if (!oldMotion) {
-        nextList.push({
-          truth: item,
-          anchor,
-          visualHeading: item.trueTrack ?? 0,
-          visualVelocity: item.velocity ?? 0,
-          visualVerticalRate: item.verticalRate ?? 0,
-          visualAltitude: altMeters,
-          accumulatedVisualLead: 0,
-          visualRate: 1.0,
-          visualLeadSeconds: 0,
-          latitude: item.latitude,
-          longitude: item.longitude,
-          altitude: altMeters,
-          trueTrack: item.trueTrack ?? 0,
-          velocity: item.velocity ?? 0,
-          verticalRate: item.verticalRate ?? 0,
-          displayPosition: initialPos,
-          physicalPosition: { latitude: item.latitude, longitude: item.longitude, altitude: altMeters },
-          confidence: 1.0,
-          screenPos: new THREE.Vector2(),
-          targetScreenSpeedPxSec: 1.3,
-          realScreenSpeedPxPerSec: 0,
-          displayScreenSpeedPxPerSec: 0,
-          truthErrorKm: 0,
-          screenLeadPx: 0,
-          inFrustum: true,
-          facingCamera: true,
-          reconciling: false,
-          blendFromLat: item.latitude,
-          blendFromLon: item.longitude,
-          blendFromAlt: altMeters,
-          reconcileStartedAt: receivedAt,
-          reconcileDuration: 0,
-          history: [{ lat: item.latitude, lon: item.longitude, alt: altMeters, time: receivedAt, pos: initialPos.clone() }],
-          lastHistorySampleTime: receivedAt,
-          lodTier: 'TIER_B',
-          showLabel: false,
-          labelPosition: new THREE.Vector2(),
-          phase: 'OBSERVED',
-          opacity: 1.0,
-        });
-      } else if (item.positionTime > oldMotion.truth.positionTime) {
-        const distKm = greatCircleDistanceKm(oldMotion.latitude, oldMotion.longitude, item.latitude, item.longitude);
-        const isFarJump = distKm > 350.0;
-        const corrDuration = isFarJump ? 0 : Math.min(3.5, Math.max(2.0, distKm / 25.0));
-        const timeDelta = Math.max(0, item.positionTime - oldMotion.anchor.positionTime);
-        // Preserve continuous motion by deducting the observation time advance from accumulated lead
-        const preservedLead = Math.max(0, (oldMotion.accumulatedVisualLead ?? 0) - timeDelta);
+  aircraft = Array.from(aircraftStore.values());
+  resolveSelectionIndices();
+}
 
-        nextList.push({
-          ...oldMotion,
-          truth: item,
-          anchor: {
-            ...anchor,
-            velocity: item.velocity ?? oldMotion.anchor.velocity,
-            trueTrack: item.trueTrack ?? oldMotion.anchor.trueTrack,
-            verticalRate: item.verticalRate ?? oldMotion.anchor.verticalRate,
-          },
-          accumulatedVisualLead: preservedLead,
-          visualLeadSeconds: preservedLead,
-          reconciling: !isFarJump,
-          blendFromLat: oldMotion.latitude,
-          blendFromLon: oldMotion.longitude,
-          blendFromAlt: oldMotion.altitude,
-          reconcileStartedAt: receivedAt,
-          reconcileDuration: corrDuration,
-          confidence: 1.0,
-          phase: 'OBSERVED',
-          opacity: 1.0,
+async function processRequestQueue() {
+  if (isQueueProcessing) return;
+  isQueueProcessing = true;
+
+  try {
+    while (requestQueue.length > 0) {
+      if (!showAircraft) {
+        requestQueue.length = 0;
+        break;
+      }
+
+      const key = requestQueue.shift()!;
+      const region = activeRegionsMap.get(key);
+      if (!region) continue;
+
+      if (Date.now() - region.lastFetchedAt < REGION_CACHE_TTL_MS && region.status === 'success') {
+        continue;
+      }
+
+      const elapsed = Date.now() - lastRequestTimeMs;
+      if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+        await new Promise((resolve) => setTimeout(resolve, MIN_REQUEST_INTERVAL_MS - elapsed));
+      }
+
+      region.status = 'loading';
+      lastRequestTimeMs = Date.now();
+
+      try {
+        const bounds = {
+          lamin: Math.max(-90, region.lat - 4.16),
+          lamax: Math.min(90, region.lat + 4.16),
+          lomin: Math.max(-180, region.lon - 4.16),
+          lomax: Math.min(180, region.lon + 4.16),
+        };
+        const query = new URLSearchParams({
+          lamin: bounds.lamin.toFixed(2),
+          lamax: bounds.lamax.toFixed(2),
+          lomin: bounds.lomin.toFixed(2),
+          lomax: bounds.lomax.toFixed(2),
         });
-      } else {
-        if (item.positionTime === oldMotion.truth.positionTime) oldMotion.truth = item;
-        nextList.push(oldMotion);
+
+        const response = await fetch(`/api/aircraft?${query.toString()}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const payload = (await response.json()) as { provider: AircraftProvider; observedAt: number; states: TruthState[] };
+        region.status = 'success';
+        region.lastFetchedAt = Date.now();
+        region.aircraftCount = payload.states.length;
+        mergeAircraftPayload(payload);
+      } catch (err) {
+        region.status = 'error';
+        region.lastFetchedAt = Date.now() - (REGION_CACHE_TTL_MS - 10000);
+        console.warn('[VECTOR aircraft stream]', key, err);
       }
     }
-
-    aircraft = nextList;
-    resolveSelectionIndices();
-    updateAircraftPositions();
-    $('#aircraft-status').textContent = `${aircraft.length.toLocaleString()} IN REGION`;
-    $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · ${formatAge(receivedAt - aircraftObservedAt)} AGO`;
-  } catch {
-    aircraftAvailable = false;
-    $('#aircraft-status').textContent = 'UNAVAILABLE';
-    $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · NO RESPONSE`;
   } finally {
-    aircraftLoading = false;
+    isQueueProcessing = false;
+  }
+}
+
+function scheduleVisibleRegionFetches() {
+  if (!showAircraft) return;
+  const now = Date.now();
+  const visibleRegions = discoverVisibleRegions();
+
+  const needed: Array<{ key: string; lat: number; lon: number; distDeg: number }> = [];
+  for (const reg of visibleRegions) {
+    const cached = activeRegionsMap.get(reg.key);
+    if (!cached || now - cached.lastFetchedAt >= REGION_CACHE_TTL_MS || cached.status === 'error') {
+      needed.push(reg);
+    }
+  }
+
+  const toEnqueue = needed.slice(0, MAX_ENQUEUED_REGIONS);
+  const visibleKeySet = new Set(visibleRegions.map((r) => r.key));
+
+  for (let i = requestQueue.length - 1; i >= 0; i--) {
+    if (!visibleKeySet.has(requestQueue[i])) {
+      requestQueue.splice(i, 1);
+    }
+  }
+
+  for (const item of toEnqueue) {
+    if (!activeRegionsMap.has(item.key)) {
+      activeRegionsMap.set(item.key, {
+        key: item.key,
+        lat: item.lat,
+        lon: item.lon,
+        radiusNm: REGION_RADIUS_NM,
+        lastFetchedAt: 0,
+        status: 'idle',
+        aircraftCount: 0,
+      });
+    }
+    if (!requestQueue.includes(item.key)) {
+      requestQueue.push(item.key);
+    }
+  }
+
+  processRequestQueue();
+}
+
+function checkCameraMovement() {
+  const current = getSubCameraCoordinates();
+  const dLat = Math.abs(current.lat - lastCheckedCamPos.lat);
+  let dLon = Math.abs(current.lon - lastCheckedCamPos.lon);
+  if (dLon > 180) dLon = 360 - dLon;
+  const dDistRatio = Math.abs(current.dist - lastCheckedCamPos.dist) / Math.max(1, lastCheckedCamPos.dist);
+
+  if (dLat > 2.0 || dLon > 2.0 || dDistRatio > 0.10) {
+    lastCheckedCamPos = current;
+    if (cameraMoveDebounceTimer !== null) {
+      clearTimeout(cameraMoveDebounceTimer);
+    }
+    cameraMoveDebounceTimer = window.setTimeout(() => {
+      cameraMoveDebounceTimer = null;
+      scheduleVisibleRegionFetches();
+    }, 450);
   }
 }
 
@@ -1598,8 +1798,7 @@ function clearSatelliteData() {
   satGlyphsMesh.count = 0;
   selectedSatHalo.visible = false;
   selectedSatGlyph.visible = false;
-  orbitLine?.removeFromParent();
-  orbitLine = undefined;
+  clearOrbit();
 }
 
 async function loadSatellites() {
@@ -1710,7 +1909,7 @@ function updateSatellites() {
 
 // Calculate Genuine Orbital Period from Satrec Mean Motion (rad/min)
 function drawOrbit(index: number) {
-  orbitLine?.removeFromParent();
+  clearOrbit();
   const item = orbiters[index];
   if (!item) return;
 
@@ -1724,9 +1923,18 @@ function drawOrbit(index: number) {
   // Sanity clamp period between 85 min (LEO) and 1440 min (GEO / 24 hr)
   periodMinutes = THREE.MathUtils.clamp(periodMinutes, 85, 1440);
 
+  // Adaptive sampling strategy based on orbital regime and eccentricity
+  const ecc = (item.satrec as unknown as Record<string, number>).ecco ?? (item.satrec as unknown as Record<string, number>).e ?? 0;
+  let numSamples = 200; // LEO default (180–240)
+  if (ecc > 0.25 || periodMinutes > 800) {
+    numSamples = 380; // GEO / High Eccentricity (320–480)
+  } else if (periodMinutes > 130) {
+    numSamples = 280; // MEO (240–320)
+  }
+  if (numSamples % 2 !== 0) numSamples++;
+
   const points: THREE.Vector3[] = [];
   const now = Date.now();
-  const numSamples = 160;
   const stepMin = periodMinutes / numSamples;
 
   for (let i = -numSamples / 2; i <= numSamples / 2; i++) {
@@ -1736,23 +1944,99 @@ function drawOrbit(index: number) {
       points.push(eciVector(propagated.position as satellite.EciVec3<number>));
     }
   }
-  const orbitGeometry = new THREE.BufferGeometry().setFromPoints(points);
-  const fullOrbit = new THREE.Line(
-    orbitGeometry,
-    new THREE.LineDashedMaterial({ color: 0x5797b7, transparent: true, opacity: 0.15, dashSize: 0.018, gapSize: 0.055, depthWrite: false, depthTest: true })
-  );
-  fullOrbit.computeLineDistances();
 
+  if (points.length < 2) return;
+
+  const orbitGroup = new THREE.Group();
+
+  // LAYER A — OCCLUDED / CONTEXT ORBIT
+  // Full propagated trajectory visible through the Earth with thin sparse dash treatment.
+  // Provides complete orbital context without competing with geography.
+  const fullGeometry = new THREE.BufferGeometry().setFromPoints(points);
+  const contextOrbit = new THREE.Line(
+    fullGeometry,
+    new THREE.LineDashedMaterial({
+      color: 0x5fa8c8,
+      transparent: true,
+      opacity: 0.07,
+      dashSize: 0.012,
+      gapSize: 0.050,
+      depthWrite: false,
+      depthTest: false,
+    })
+  );
+  contextOrbit.computeLineDistances();
+  orbitGroup.add(contextOrbit);
+
+  // LAYER B — VISIBLE DEPTH-TESTED ORBIT
+  // Camera-facing portion naturally dominates via depth testing.
+  // Subtle past vs future split around current UTC (midpoint index).
   const midpoint = Math.floor(points.length / 2);
-  const nearPoints = points.slice(Math.max(0, midpoint - 12), Math.min(points.length, midpoint + 13));
-  const nearOrbit = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(nearPoints),
-    new THREE.LineDashedMaterial({ color: 0x75bdd8, transparent: true, opacity: 0.40, dashSize: 0.022, gapSize: 0.048, depthWrite: false, depthTest: true })
-  );
-  nearOrbit.computeLineDistances();
+  const pastPoints = points.slice(0, midpoint + 1);
+  const futurePoints = points.slice(midpoint);
 
-  orbitLine = new THREE.Group();
-  orbitLine.add(fullOrbit, nearOrbit);
+  if (pastPoints.length >= 2) {
+    const pastGeo = new THREE.BufferGeometry().setFromPoints(pastPoints);
+    const pastOrbit = new THREE.Line(
+      pastGeo,
+      new THREE.LineDashedMaterial({
+        color: 0x5a9ebf,
+        transparent: true,
+        opacity: 0.22,
+        dashSize: 0.018,
+        gapSize: 0.042,
+        depthWrite: false,
+        depthTest: true,
+      })
+    );
+    pastOrbit.computeLineDistances();
+    orbitGroup.add(pastOrbit);
+  }
+
+  if (futurePoints.length >= 2) {
+    const futureGeo = new THREE.BufferGeometry().setFromPoints(futurePoints);
+    const futureOrbit = new THREE.Line(
+      futureGeo,
+      new THREE.LineDashedMaterial({
+        color: 0x75bdd8,
+        transparent: true,
+        opacity: 0.32,
+        dashSize: 0.020,
+        gapSize: 0.038,
+        depthWrite: false,
+        depthTest: true,
+      })
+    );
+    futureOrbit.computeLineDistances();
+    orbitGroup.add(futureOrbit);
+  }
+
+  // CURRENT-POSITION EMPHASIS
+  // Restrained temporal window (±6% of orbital period around current UTC)
+  const windowSamples = Math.max(3, Math.round(numSamples * 0.06));
+  const nearStart = Math.max(0, midpoint - windowSamples);
+  const nearEnd = Math.min(points.length, midpoint + windowSamples + 1);
+  const nearPoints = points.slice(nearStart, nearEnd);
+
+  if (nearPoints.length >= 2) {
+    const nearGeo = new THREE.BufferGeometry().setFromPoints(nearPoints);
+    const nearOrbit = new THREE.Line(
+      nearGeo,
+      new THREE.LineDashedMaterial({
+        color: 0x9be0f7,
+        transparent: true,
+        opacity: 0.60,
+        dashSize: 0.024,
+        gapSize: 0.028,
+        depthWrite: false,
+        depthTest: true,
+      })
+    );
+    nearOrbit.computeLineDistances();
+    orbitGroup.add(nearOrbit);
+  }
+
+  orbitLine = orbitGroup;
   equatorialFrame.add(orbitLine);
 }
 
@@ -1816,11 +2100,15 @@ function updateSatelliteInspector(now: Date) {
 
 function updateStatuses(now: Date) {
   const freshAircraftCount = aircraft.filter((item) => (now.getTime() / 1000) - item.truth.positionTime <= 120).length;
+  const visibleAircraftCount = aircraft.filter((item) => item.inFrustum && item.facingCamera && item.opacity > 0).length;
+  const activeLiveRegions = Array.from(activeRegionsMap.values()).filter(
+    (r) => Date.now() - r.lastFetchedAt <= REGION_CACHE_TTL_MS * 2 && r.status === 'success'
+  ).length;
 
   if (showAircraft) {
     if (aircraftAvailable) {
-      $('#aircraft-status').textContent = `${freshAircraftCount.toLocaleString()} IN REGION`;
-      $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · ${formatAge(now.getTime() / 1000 - aircraftObservedAt)} AGO`;
+      $('#aircraft-status').textContent = `${visibleAircraftCount.toLocaleString()} VISIBLE`;
+      $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · ${activeLiveRegions} LIVE REGION${activeLiveRegions === 1 ? '' : 'S'}`;
     } else {
       $('#aircraft-status').textContent = 'UNAVAILABLE';
       $('#aircraft-meta').textContent = `${aircraftProviderLabel()} · NO RESPONSE`;
@@ -1955,8 +2243,7 @@ function clearSelection() {
   cameraMode = 'MANUAL';
   selectedSatHalo.visible = selectedSatGlyph.visible = false;
   selectedAircraftGlyph.visible = selectedAircraftHalo.visible = false;
-  orbitLine?.removeFromParent();
-  orbitLine = undefined;
+  clearOrbit();
   $('#inspector').hidden = true;
   $('#status-drawer').style.opacity = '1';
 }
@@ -2027,8 +2314,7 @@ $('#toggle-satellites').addEventListener('click', (event) => {
     selectedSatelliteNorad = null;
     selectedSatHalo.visible = false;
     selectedSatGlyph.visible = false;
-    orbitLine?.removeFromParent();
-    orbitLine = undefined;
+    clearOrbit();
     $('#inspector').hidden = true;
   }
   updateStatuses(new Date());
@@ -2053,7 +2339,7 @@ $('#toggle-aircraft').addEventListener('click', (event) => {
       $('#inspector').hidden = true;
     }
   } else {
-    loadAircraft();
+    scheduleVisibleRegionFetches();
   }
   updateStatuses(new Date());
 });
@@ -2233,6 +2519,7 @@ function render(now: number) {
   updateLandmarkProbes(nowDate.getTime() / 1000);
   updateMotionProbes(nowDate.getTime() / 1000);
   updateObserverBeacon(nowSeconds);
+  checkCameraMovement();
 
   // 4. Status & Telemetry Refresh
   if (now - lastStatusUpdate > 500) {
@@ -2244,42 +2531,30 @@ function render(now: number) {
   selectedSatHalo.lookAt(camera.position);
   selectedSatGlyph.lookAt(camera.position);
 
-  // 6. Degree & Reference Grid Visibility
-  const cameraDir = camera.position.clone().normalize();
+  // 6. Astronomical Reference Instrument Zoom Fading
   const cameraDist = camera.position.distanceTo(controls.target);
+  const eclipticZoomFactor = THREE.MathUtils.clamp((cameraDist - 7.0) / (15.0 - 7.0), 0, 1);
+  const tiltZoomFactor = THREE.MathUtils.clamp((cameraDist - 5.5) / (12.0 - 5.5), 0, 1);
+  const axisZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.5) / (10.0 - 4.5), 0.15, 1);
 
-  for (const label of degreeLabels) {
-    if (label.isTiltText && cameraDist > 24.0) {
-      label.sprite.visible = false;
-      continue;
-    }
-    if (label.tier === 'MAJOR' && cameraDist > 20.0) {
-      label.sprite.visible = false;
-      continue;
-    }
-    if (label.tier === 'MINOR' && cameraDist > 13.0) {
-      label.sprite.visible = false;
-      continue;
-    }
-    const worldPos = label.sprite.getWorldPosition(new THREE.Vector3());
-    const facing = worldPos.normalize().dot(cameraDir);
-    const facingThreshold = label.isTiltText ? -0.05 : 0.15;
+  eclipticRingMat.opacity = 0.08 * eclipticZoomFactor;
+  eclipticRingLine.visible = eclipticRingMat.opacity > 0.005;
 
-    if (facing > facingThreshold) {
-      const targetOpacity = label.tier === 'ANCHOR' ? 0.40 : 0.24;
-      label.material.opacity = Math.min(targetOpacity, (facing - facingThreshold) * 0.8);
-      label.sprite.visible = true;
-    } else {
-      label.material.opacity = 0;
-      label.sprite.visible = false;
-    }
-  }
+  eclipticNormalMat.opacity = 0.20 * tiltZoomFactor;
+  tiltMat.opacity = 0.28 * tiltZoomFactor;
+  tiltArcLine.visible = tiltMat.opacity > 0.005;
+  eclipticNormalLine.visible = eclipticNormalMat.opacity > 0.005;
+
+  axisMat.opacity = 0.24 * axisZoomFactor;
+  axisLine.visible = axisMat.opacity > 0.005;
 
   // 7. Screen-Space DOM Label Overlay
   updateDomLabels(cameraDist);
 
-  // 8. Controls are the only manual camera writer.  They also remain active
-  // immediately after Locate Me finishes.
+  // 8. Adaptive sensitivity and controls update
+  const { rotateSpeed, dampingFactor } = computeAdaptiveControlsSensitivity(cameraDist);
+  controls.rotateSpeed = rotateSpeed;
+  controls.dampingFactor = dampingFactor;
   controls.update();
 
   // 9. Master Render Call
@@ -2288,10 +2563,10 @@ function render(now: number) {
 }
 
 // Initial Data Fetching & Polling
-loadAircraft();
+scheduleVisibleRegionFetches();
 loadSatellites();
 
-window.setInterval(loadAircraft, 30000);
+window.setInterval(scheduleVisibleRegionFetches, 25000);
 window.setInterval(loadSatellites, 2 * 60 * 60 * 1000);
 
 window.addEventListener('resize', () => {
