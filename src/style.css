@@ -711,10 +711,110 @@ button {
   z-index: 7;
 }
 
-.ref-label.tilt-angle {
+.sci-line-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  transition: opacity 0.18s ease;
+  z-index: 7;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.95), 0 0 4px rgba(0, 0, 0, 0.70);
+}
+
+@keyframes orbitTelemetrySignal {
+  0%, 70%, 100% { opacity: 0.75; color: #c0f2ff; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.70); }
+  78% { opacity: 0.88; color: #d8f5ff; }
+  84% { opacity: 0.98; color: #ffffff; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 5px rgba(106, 203, 251, 0.45); }
+  91% { opacity: 0.82; color: #c0f2ff; }
+}
+
+@keyframes termTelemetrySignal {
+  0%, 70%, 100% { opacity: 0.55; color: #a2cadc; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.70); }
+  78% { opacity: 0.65; color: #c2e2f0; }
+  84% { opacity: 0.72; color: #e0f4ff; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(162, 202, 220, 0.35); }
+  91% { opacity: 0.60; color: #a2cadc; }
+}
+
+@keyframes tiltTelemetrySignal {
+  0%, 70%, 100% { opacity: 0.62; color: #a8e6fc; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.70); }
+  78% { opacity: 0.70; color: #c6f0ff; }
+  84% { opacity: 0.78; color: #e6f8ff; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(168, 230, 252, 0.35); }
+  91% { opacity: 0.66; color: #a8e6fc; }
+}
+
+@keyframes axisTelemetrySignal {
+  0%, 70%, 100% { opacity: 0.55; color: #9ad0ea; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.70); }
+  78% { opacity: 0.62; color: #b8e0f5; }
+  84% { opacity: 0.68; color: #d6effc; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(154, 208, 234, 0.30); }
+  91% { opacity: 0.58; color: #9ad0ea; }
+}
+
+@keyframes eclipticTelemetrySignal {
+  0%, 70%, 100% { opacity: 0.38; color: #4e7a90; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(0,0,0,0.70); }
+  78% { opacity: 0.43; color: #6d9cb2; }
+  84% { opacity: 0.46; color: #8cbcd2; text-shadow: 0 0 2px rgba(0,0,0,0.95), 0 0 4px rgba(78, 122, 144, 0.30); }
+  91% { opacity: 0.40; color: #4e7a90; }
+}
+
+.sci-line-label.orbit-label {
   font-size: 9px;
-  color: #7bb5cc;
-  letter-spacing: 0.06em;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  color: #c0f2ff;
+  z-index: 9;
+  animation: orbitTelemetrySignal 2.2s ease-in-out infinite;
+  animation-delay: 0s;
+}
+
+.sci-line-label.terminator-label {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: #a2cadc;
+  animation: termTelemetrySignal 3.0s ease-in-out infinite;
+  animation-delay: -0.8s;
+}
+
+.sci-line-label.axis-label {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: #9ad0ea;
+  animation: axisTelemetrySignal 4.0s ease-in-out infinite;
+  animation-delay: -2.2s;
+}
+
+.sci-line-label.tilt-label {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: #a8e6fc;
+  animation: tiltTelemetrySignal 3.4s ease-in-out infinite;
+  animation-delay: -1.6s;
+}
+
+.sci-line-label.ecliptic-label {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: #4e7a90;
+  animation: eclipticTelemetrySignal 4.8s ease-in-out infinite;
+  animation-delay: -3.1s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sci-line-label,
+  .sci-line-label.orbit-label,
+  .sci-line-label.terminator-label,
+  .sci-line-label.tilt-label,
+  .sci-line-label.axis-label,
+  .sci-line-label.ecliptic-label {
+    animation: none !important;
+  }
 }
 
 /* TRACK BUTTON IN INSPECTOR */

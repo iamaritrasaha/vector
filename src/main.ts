@@ -28,12 +28,25 @@ import {
 } from './scene/motionEngine';
 import type { TruthState, DisplayState, ObservationAnchor } from './scene/motionEngine';
 import { COUNTRY_LABELS } from './scene/countryLabels';
+import { calculateSolarState, verifySolarEphemeris } from './scene/solarEphemeris';
+import type { SolarState } from './scene/solarEphemeris';
+import { Line2 } from 'three/examples/jsm/lines/Line2.js';
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import './style.css';
 import './status.css';
 
 // Automated Kinematic Verification Check
 const verificationResult = verifyMotionMath();
 console.log('[VECTOR MOTION ENGINE VERIFICATION]', verificationResult.log.join(' | '));
+
+// Automated Solar Ephemeris Astronomical Verification Check
+const solarVerification = verifySolarEphemeris();
+console.log(
+  '[VECTOR SOLAR EPHEMERIS VERIFICATION]',
+  solarVerification.passed ? 'PASSED (EQUINOX/SOLSTICE/LENGTH/BOUNDS)' : 'FAILED',
+  solarVerification.results
+);
 
 // DOM Selectors & Scale Constants
 const canvas = document.querySelector<HTMLCanvasElement>('#vector-canvas')!;
@@ -285,7 +298,7 @@ scene.add(equatorialFrame);
 const earth = new THREE.Group();
 equatorialFrame.add(earth);
 
-// Refined Earth Core Sphere Shader (Uniform, subtle atmosphere limb)
+// Refined Earth Core Sphere Shader (Physically tied to astronomical Sun direction, narrow terminator, subtle atmosphere limb)
 const globeMaterial = new THREE.ShaderMaterial({
   vertexShader: `
     varying vec3 vNormal;
@@ -306,26 +319,28 @@ const globeMaterial = new THREE.ShaderMaterial({
       vec3 sunDir = normalize(uSunDirection);
       vec3 viewDir = normalize(cameraPosition - vWorldPosition);
 
-      float NdotL = max(0.0, dot(normal, sunDir));
-      float dayFactor = smoothstep(-0.25, 0.30, dot(normal, sunDir));
+      float NdotSun = dot(normal, sunDir);
+      float dayFactor = smoothstep(-0.06, 0.08, NdotSun);
 
-      vec3 deepOcean = vec3(0.010, 0.028, 0.050);
-      vec3 landGlow = vec3(0.032, 0.075, 0.110);
+      vec3 deepOcean = vec3(0.011, 0.030, 0.054);
+      vec3 landGlow = vec3(0.038, 0.082, 0.124);
       vec3 baseColor = mix(deepOcean, landGlow, 0.22);
 
-      vec3 dayColor = baseColor * (0.50 + 0.50 * NdotL);
-      vec3 nightColor = deepOcean * 0.12;
+      float NdotL = max(0.0, NdotSun);
+      vec3 dayColor = baseColor * (0.58 + 0.62 * NdotL);
+      vec3 nightColor = deepOcean * 0.09;
       vec3 color = mix(nightColor, dayColor, dayFactor);
 
-      // Subtle atmosphere limb
+      // Sun-aware atmosphere limb
       float fresnel = pow(1.0 - max(0.0, dot(viewDir, normal)), 4.5);
-      vec3 atmosphereGlow = vec3(0.25, 0.48, 0.65) * fresnel * (0.25 + 0.75 * dayFactor) * 0.28;
+      float atmoSunFactor = smoothstep(-0.10, 0.12, NdotSun);
+      vec3 atmosphereGlow = vec3(0.26, 0.48, 0.66) * fresnel * (0.04 + 0.26 * atmoSunFactor) * 0.95;
 
       gl_FragColor = vec4(color + atmosphereGlow, 1.0);
     }
   `,
   uniforms: {
-    uSunDirection: { value: new THREE.Vector3(1, 0.3, 1).normalize() },
+    uSunDirection: { value: new THREE.Vector3(0, 0, 1) },
   },
 });
 
@@ -409,42 +424,164 @@ function earthReferenceCircle(latitude: number, longitude: number, isMeridian: b
 earth.add(earthReferenceCircle(0, 0, false));
 earth.add(earthReferenceCircle(0, 0, true));
 
+// Fat-Line Material Registry for Responsive Viewport Updates
+const fatLineMaterials: LineMaterial[] = [];
+function registerFatLineMaterial<T extends LineMaterial>(mat: T): T {
+  mat.resolution.set(window.innerWidth, window.innerHeight);
+  fatLineMaterials.push(mat);
+  return mat;
+}
+
+// Subtle Scientific Day/Night Geometric Terminator Line (Physical Boundary Language: Continuous Solid Line, 1.25 px)
+const TERMINATOR_SAMPLES = 144;
+const terminatorPositions = new Float32Array((TERMINATOR_SAMPLES + 1) * 3);
+const terminatorGeo = new LineGeometry();
+terminatorGeo.setPositions(terminatorPositions);
+const terminatorMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0x9dc4d8,
+    linewidth: 1.25,
+    transparent: true,
+    opacity: 0.22,
+    depthTest: true,
+    depthWrite: false,
+    dashed: false,
+  })
+);
+const terminatorLine = new Line2(terminatorGeo, terminatorMat);
+earth.add(terminatorLine);
+
+// Subsolar Point Instrument Marker (Overhead Sun location, zoom-adaptive visibility)
+const subsolarPts: THREE.Vector3[] = [];
+for (let i = 0; i <= 16; i++) {
+  const theta = (i / 16) * Math.PI * 2;
+  subsolarPts.push(new THREE.Vector3(Math.cos(theta) * 0.024, 0, Math.sin(theta) * 0.024));
+}
+const subsolarRingGeo = new THREE.BufferGeometry().setFromPoints(subsolarPts);
+const subsolarRingMat = new THREE.LineBasicMaterial({
+  color: 0xb0deee,
+  transparent: true,
+  opacity: 0.42,
+  depthTest: true,
+  depthWrite: false,
+});
+const subsolarMarker = new THREE.Line(subsolarRingGeo, subsolarRingMat);
+earth.add(subsolarMarker);
+
+// Authoritative Solar State Manager
+let currentSolarState: SolarState = calculateSolarState(Date.now());
+const currentSunWorldDirection = new THREE.Vector3(0, 0, 1);
+let lastSolarEphemerisUpdateMs = 0;
+
+const solarEarthInv = new THREE.Matrix4();
+const solarLocalSun = new THREE.Vector3();
+const solarBasisU = new THREE.Vector3();
+const solarBasisV = new THREE.Vector3();
+const solarRefAxis = new THREE.Vector3();
+
+function updateSolarSystem(realUtcDate: Date, cameraDist: number) {
+  const realUtcMs = realUtcDate.getTime();
+  if (realUtcMs - lastSolarEphemerisUpdateMs >= 2000 || lastSolarEphemerisUpdateMs === 0) {
+    currentSolarState = calculateSolarState(realUtcMs);
+    lastSolarEphemerisUpdateMs = realUtcMs;
+  }
+
+  // 1. Map equatorial solar vector to world coordinates via equatorialFrame
+  equatorialFrame.updateWorldMatrix(true, false);
+  currentSunWorldDirection
+    .copy(currentSolarState.directionEquatorial)
+    .transformDirection(equatorialFrame.matrixWorld)
+    .normalize();
+  (globeMaterial.uniforms.uSunDirection.value as THREE.Vector3).copy(currentSunWorldDirection);
+
+  // 2. Update geometric terminator great circle in Earth-local coordinates
+  solarEarthInv.copy(earth.matrixWorld).invert();
+  solarLocalSun.copy(currentSunWorldDirection).transformDirection(solarEarthInv).normalize();
+
+  if (Math.abs(solarLocalSun.y) < 0.99) {
+    solarRefAxis.set(0, 1, 0);
+  } else {
+    solarRefAxis.set(1, 0, 0);
+  }
+  solarBasisU.crossVectors(solarRefAxis, solarLocalSun).normalize();
+  solarBasisV.crossVectors(solarLocalSun, solarBasisU).normalize();
+
+  const r = earthRadius + 0.004;
+  for (let i = 0; i <= TERMINATOR_SAMPLES; i++) {
+    const theta = (i / TERMINATOR_SAMPLES) * Math.PI * 2;
+    const cosT = Math.cos(theta);
+    const sinT = Math.sin(theta);
+    terminatorPositions[i * 3] = (solarBasisU.x * cosT + solarBasisV.x * sinT) * r;
+    terminatorPositions[i * 3 + 1] = (solarBasisU.y * cosT + solarBasisV.y * sinT) * r;
+    terminatorPositions[i * 3 + 2] = (solarBasisU.z * cosT + solarBasisV.z * sinT) * r;
+  }
+  terminatorGeo.setPositions(terminatorPositions);
+
+  // Zoom-aware terminator line opacity reduction at close zoom
+  const terminatorZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.6) / (7.0 - 4.6), 0.70, 1.0);
+  terminatorMat.opacity = 0.22 * terminatorZoomFactor;
+
+  // 3. Update subsolar marker position & zoom-adaptive fading directly from solarLocalSun
+  subsolarMarker.position.copy(solarLocalSun).multiplyScalar(earthRadius + 0.005);
+  subsolarMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), solarLocalSun);
+
+  const subsolarZoomFactor = THREE.MathUtils.clamp((cameraDist - 6.0) / (10.0 - 6.0), 0, 1);
+  subsolarRingMat.opacity = 0.42 * subsolarZoomFactor;
+  subsolarMarker.visible = subsolarRingMat.opacity > 0.01;
+}
+
 // Restrained Astronomical Reference Instrument
 const instrumentGroup = new THREE.Group();
 
-// 1. Hairline Polar Rotation Axis with Clean Terminal Ticks
-const axisSegments = [
-  // Rotational axis shaft through Earth's geographic poles (Earth radius = 4.0, extent = 4.40)
-  0, -4.40, 0,  0, 4.40, 0,
-  // North pole terminal tick
-  -0.03, 4.40, 0,  0.03, 4.40, 0,
-  // South pole terminal tick
-  -0.03, -4.40, 0,  0.03, -4.40, 0,
-];
-const axisGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(axisSegments, 3));
-const axisMat = new THREE.LineBasicMaterial({ color: 0x7eb0c8, transparent: true, opacity: 0.24, depthWrite: false });
-const axisLine = new THREE.LineSegments(axisGeo, axisMat);
+// 1. Hairline Polar Rotation Axis with Clean Terminal Ticks (Reference Axis Language: Solid Line, 1.6 px)
+const axisMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0x9ad0ea,
+    linewidth: 1.6,
+    transparent: true,
+    opacity: 0.38,
+    depthWrite: false,
+    dashed: false,
+  })
+);
+const axisShaftGeo = new LineGeometry();
+axisShaftGeo.setPositions([0, -4.40, 0, 0, 4.40, 0]);
+const axisNorthGeo = new LineGeometry();
+axisNorthGeo.setPositions([-0.03, 4.40, 0, 0.03, 4.40, 0]);
+const axisSouthGeo = new LineGeometry();
+axisSouthGeo.setPositions([-0.03, -4.40, 0, 0.03, -4.40, 0]);
+
+const axisLine = new THREE.Group();
+axisLine.add(new Line2(axisShaftGeo, axisMat));
+axisLine.add(new Line2(axisNorthGeo, axisMat));
+axisLine.add(new Line2(axisSouthGeo, axisMat));
 instrumentGroup.add(axisLine);
 
-// 2. Subtle Ecliptic Reference Plane Ring (Inertial Reference Ring)
-const eclipticRingPts: THREE.Vector3[] = [];
+// 2. Subtle Ecliptic Reference Plane Ring (Construction/Plane Language: Very Long Dash + Large Gap, 0.9 px)
+const eclipticRingFlatPtsFull: number[] = [];
 for (let i = 0; i <= 128; i++) {
   const theta = (i / 128) * Math.PI * 2;
   const r = 4.28;
   const v = new THREE.Vector3(r * Math.cos(theta), 0, r * Math.sin(theta));
   v.applyAxisAngle(new THREE.Vector3(0, 0, 1), obliquity);
-  eclipticRingPts.push(v);
+  eclipticRingFlatPtsFull.push(v.x, v.y, v.z);
 }
-const eclipticRingGeo = new THREE.BufferGeometry().setFromPoints(eclipticRingPts);
-const eclipticRingMat = new THREE.LineDashedMaterial({
-  color: 0x3d6377,
-  transparent: true,
-  opacity: 0.08,
-  dashSize: 0.06,
-  gapSize: 0.08,
-  depthWrite: false,
-});
-const eclipticRingLine = new THREE.Line(eclipticRingGeo, eclipticRingMat);
+const eclipticRingGeo = new LineGeometry();
+eclipticRingGeo.setPositions(eclipticRingFlatPtsFull);
+const eclipticRingMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0x325262,
+    linewidth: 0.9,
+    transparent: true,
+    opacity: 0.09,
+    dashed: true,
+    dashScale: 1.0,
+    dashSize: 0.60,
+    gapSize: 0.40,
+    depthWrite: false,
+  })
+);
+const eclipticRingLine = new Line2(eclipticRingGeo, eclipticRingMat);
 eclipticRingLine.computeLineDistances();
 instrumentGroup.add(eclipticRingLine);
 
@@ -453,25 +590,67 @@ const eclipticNorm = new THREE.Vector3(-Math.sin(obliquity), Math.cos(obliquity)
 const eclNormStart = eclipticNorm.clone().multiplyScalar(4.12);
 const eclNormEnd = eclipticNorm.clone().multiplyScalar(4.40);
 const eclPerp = new THREE.Vector3(eclipticNorm.y, -eclipticNorm.x, 0).multiplyScalar(0.025);
-const eclipticGuidePts = [
-  eclNormStart.x, eclNormStart.y, eclNormStart.z,  eclNormEnd.x, eclNormEnd.y, eclNormEnd.z,
-  eclNormEnd.x - eclPerp.x, eclNormEnd.y - eclPerp.y, eclNormEnd.z,  eclNormEnd.x + eclPerp.x, eclNormEnd.y + eclPerp.y, eclNormEnd.z,
-];
-const eclipticGuideGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(eclipticGuidePts, 3));
-const eclipticNormalMat = new THREE.LineBasicMaterial({ color: 0x487085, transparent: true, opacity: 0.20, depthWrite: false });
-const eclipticNormalLine = new THREE.LineSegments(eclipticGuideGeo, eclipticNormalMat);
+
+const eclipticNormalMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0x527e94,
+    linewidth: 1.1,
+    transparent: true,
+    opacity: 0.22,
+    dashed: true,
+    dashScale: 1.0,
+    dashSize: 0.05,
+    gapSize: 0.04,
+    depthWrite: false,
+  })
+);
+const eclNormGeo = new LineGeometry();
+eclNormGeo.setPositions([
+  eclNormStart.x, eclNormStart.y, eclNormStart.z,
+  eclNormEnd.x, eclNormEnd.y, eclNormEnd.z,
+]);
+const eclNormTickGeo = new LineGeometry();
+eclNormTickGeo.setPositions([
+  eclNormEnd.x - eclPerp.x, eclNormEnd.y - eclPerp.y, eclNormEnd.z,
+  eclNormEnd.x + eclPerp.x, eclNormEnd.y + eclPerp.y, eclNormEnd.z,
+]);
+const eclNormShaftLine = new Line2(eclNormGeo, eclipticNormalMat);
+eclNormShaftLine.computeLineDistances();
+const eclNormTickLine = new Line2(eclNormTickGeo, eclipticNormalMat);
+eclNormTickLine.computeLineDistances();
+
+const eclipticNormalLine = new THREE.Group();
+eclipticNormalLine.add(eclNormShaftLine);
+eclipticNormalLine.add(eclNormTickLine);
 instrumentGroup.add(eclipticNormalLine);
 
-// Precision 23.44° Axial Tilt Arc
-const tiltArcPts: THREE.Vector3[] = [];
+// Precision 23.44° Axial Tilt Arc (Measurement Language: Short Dot / Micro-dash Arc, 1.6 px)
+const tiltArcFlatPtsFull: number[] = [];
 const tiltRadius = 4.28;
 for (let i = 0; i <= 24; i++) {
   const angle = (i / 24) * obliquity;
-  tiltArcPts.push(new THREE.Vector3(-tiltRadius * Math.sin(angle), tiltRadius * Math.cos(angle), 0));
+  const x = -tiltRadius * Math.sin(angle);
+  const y = tiltRadius * Math.cos(angle);
+  tiltArcFlatPtsFull.push(x, y, 0);
 }
-const tiltGeo = new THREE.BufferGeometry().setFromPoints(tiltArcPts);
-const tiltMat = new THREE.LineBasicMaterial({ color: 0x7cb2cc, transparent: true, opacity: 0.28, depthWrite: false });
-const tiltArcLine = new THREE.Line(tiltGeo, tiltMat);
+const tiltGeoFull = new LineGeometry();
+tiltGeoFull.setPositions(tiltArcFlatPtsFull);
+
+const tiltMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0xa6e2fc,
+    linewidth: 1.6,
+    transparent: true,
+    opacity: 0.50,
+    dashed: true,
+    dashScale: 1.0,
+    dashSize: 0.035,
+    gapSize: 0.045,
+    depthWrite: false,
+  })
+);
+const tiltArcLine = new Line2(tiltGeoFull, tiltMat);
+tiltArcLine.computeLineDistances();
 instrumentGroup.add(tiltArcLine);
 
 equatorialFrame.add(instrumentGroup);
@@ -520,17 +699,39 @@ selectedSatHalo.visible = false;
 equatorialFrame.add(selectedSatHalo);
 
 let orbitLine: THREE.Group | undefined;
+let currentSelectedOrbitPoints: THREE.Vector3[] = [];
+
+const _sciVecA = new THREE.Vector3();
+const _sciVecB = new THREE.Vector3();
+const _sciVecC = new THREE.Vector3();
+
+function toFlatPoints(pts: THREE.Vector3[]): Float32Array {
+  const arr = new Float32Array(pts.length * 3);
+  for (let i = 0; i < pts.length; i++) {
+    arr[i * 3] = pts[i].x;
+    arr[i * 3 + 1] = pts[i].y;
+    arr[i * 3 + 2] = pts[i].z;
+  }
+  return arr;
+}
 
 function clearOrbit() {
+  currentSelectedOrbitPoints = [];
+  const orbitLabelEl = document.querySelector<HTMLElement>('#sci-label-orbit');
+  if (orbitLabelEl) orbitLabelEl.style.display = 'none';
+
   if (!orbitLine) return;
   orbitLine.traverse((child) => {
-    if (child instanceof THREE.Line || child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
+    if (child instanceof Line2 || child instanceof THREE.Line || child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
       child.geometry?.dispose();
-      if (Array.isArray(child.material)) {
-        child.material.forEach((m) => m.dispose());
-      } else if (child.material) {
-        child.material.dispose();
-      }
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => {
+        if (m instanceof LineMaterial) {
+          const idx = fatLineMaterials.indexOf(m);
+          if (idx !== -1) fatLineMaterials.splice(idx, 1);
+        }
+        m?.dispose();
+      });
     }
   });
   orbitLine.removeFromParent();
@@ -1218,70 +1419,129 @@ function updateAircraftPositions() {
   }
 }
 
-// Callsign, Satellite Name & Cartographic Country DOM Label Manager
+// Callsign, Satellite Name, Cartographic Country & Scientific Line Annotation DOM Manager
 function updateDomLabels(cameraDistance: number) {
   labelCollisionManager.reset();
   let poolIdx = 0;
   const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
+  const camDir = camera.position.clone().sub(controls.target).normalize();
+  equatorialFrame.updateWorldMatrix(true, false);
+  earth.updateWorldMatrix(true, false);
 
-  // Reduced callsign label density at regional and continental scales
-  const maxPlacedAirLabels = cameraDistance > 16.0 ? 0 : cameraDistance > 9.0 ? 5 : cameraDistance > 5.5 ? 8 : 18;
+  // =========================================================================
+  // PRIORITY 1: Selected Aircraft & Selected Satellite Primary Labels
+  // =========================================================================
 
-  // 1. Aircraft Callsigns (Highest priority)
-  if (showAircraft) {
-    for (let index = 0; index < aircraft.length; index++) {
-      const motion = aircraft[index];
-      const isSelected = index === selectedAircraftIndex;
-      const isHovered = motion.truth.icao24 === hoveredIcao;
-
-      if (cameraDistance > 18.0 && !isSelected && !isHovered) continue;
-      if (motion.opacity <= 0 || !motion.inFrustum || !motion.facingCamera) continue;
-      // Micro-contacts (TIER_A) are NEVER labeled unless selected or hovered
-      if (motion.lodTier !== 'TIER_B' && !isSelected && !isHovered) continue;
-      // Limit total placed labels for clean cartographic look
-      if (poolIdx >= maxPlacedAirLabels && !isSelected && !isHovered) continue;
-
+  // 1A. Selected/Hovered Aircraft Callsign
+  if (showAircraft && selectedAircraftIndex >= 0 && aircraft[selectedAircraftIndex]) {
+    const motion = aircraft[selectedAircraftIndex];
+    if (motion.opacity > 0 && motion.inFrustum && motion.facingCamera) {
       const callsign = (motion.truth.callsign || motion.truth.icao24).trim();
       const flAlt = `FL${Math.round(motion.altitude / 304.8)}`;
       const speedMps = `${Math.round(motion.velocity)} m/s`;
-
-      const showSubtext = cameraDistance < 6.5 || isSelected || isHovered;
       const widthEstimate = callsign.length * 6.5 + 14;
-      const heightEstimate = showSubtext ? 26 : 16;
+      const heightEstimate = 26;
 
-      const canPlace = labelCollisionManager.tryPlaceLabel(
-        motion.screenPos.x,
-        motion.screenPos.y,
-        widthEstimate,
-        heightEstimate,
-        isSelected || isHovered
-      );
-
-      if (canPlace) {
+      if (labelCollisionManager.tryPlaceLabel(motion.screenPos.x, motion.screenPos.y, widthEstimate, heightEstimate, true)) {
         let labelEl = domLabelPool[poolIdx];
         if (!labelEl) {
           labelEl = document.createElement('div');
-          labelEl.className = 'aircraft-label';
+          labelEl.className = 'aircraft-label selected-label';
           labelsContainer.appendChild(labelEl);
           domLabelPool.push(labelEl);
         }
-
-        labelEl.className = `aircraft-label ${isSelected ? 'selected-label' : ''}`;
+        labelEl.className = 'aircraft-label selected-label';
         labelEl.style.display = 'block';
         labelEl.style.left = `${motion.screenPos.x}px`;
         labelEl.style.top = `${motion.screenPos.y}px`;
-        labelEl.style.opacity = String(Math.min(1.0, motion.opacity));
-
-        labelEl.innerHTML = showSubtext
-          ? `<div class="callsign">${escapeHtml(callsign)}</div><div class="subtext">${flAlt} · ${speedMps}</div>`
-          : `<div class="callsign">${escapeHtml(callsign)}</div>`;
-
+        labelEl.style.opacity = '1.0';
+        labelEl.innerHTML = `<div class="callsign">${escapeHtml(callsign)}</div><div class="subtext">${flAlt} · ${speedMps}</div>`;
         poolIdx++;
       }
     }
   }
 
-  // 2. Observer Geolocation Coordinates (Crisp DOM/CSS Overlay)
+  // 1B. Selected Satellite Name
+  if (showSatellites && selectedSatelliteIndex >= 0 && orbiters[selectedSatelliteIndex]) {
+    const orbiter = orbiters[selectedSatelliteIndex];
+    const propagated = satellite.propagate(orbiter.satrec, new Date());
+    if (propagated && propagated.position) {
+      const eciPos = eciVector(propagated.position as satellite.EciVec3<number>);
+      const worldPos = eciPos.clone().applyMatrix4(equatorialFrame.matrixWorld);
+      const screenVec = worldPos.clone().project(camera);
+      if (screenVec.z <= 1.0 && worldPos.clone().normalize().dot(camDir) >= 0.1) {
+        const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
+        const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
+        const nameStr = orbiter.name.trim() || `NORAD ${orbiter.norad}`;
+        const widthEstimate = nameStr.length * 6 + 14;
+
+        if (labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, 16, true)) {
+          let labelEl = domLabelPool[poolIdx];
+          if (!labelEl) {
+            labelEl = document.createElement('div');
+            labelEl.className = 'aircraft-label selected-label';
+            labelsContainer.appendChild(labelEl);
+            domLabelPool.push(labelEl);
+          }
+          labelEl.className = 'aircraft-label selected-label';
+          labelEl.style.display = 'block';
+          labelEl.style.left = `${screenX}px`;
+          labelEl.style.top = `${screenY}px`;
+          labelEl.style.opacity = '1.0';
+          labelEl.innerHTML = `<div class="callsign" style="color: #6acbfb;">${escapeHtml(nameStr)}</div>`;
+          poolIdx++;
+        }
+      }
+    }
+  }
+
+  // =========================================================================
+  // PRIORITY 2: Selected Satellite Orbit Annotation (ORBIT · PROPAGATED)
+  // =========================================================================
+  let orbitLabelEl = document.querySelector<HTMLElement>('#sci-label-orbit');
+  if (selectedSatelliteIndex >= 0 && currentSelectedOrbitPoints.length >= 10 && cameraDistance >= 4.6) {
+    if (!orbitLabelEl) {
+      orbitLabelEl = document.createElement('div');
+      orbitLabelEl.id = 'sci-label-orbit';
+      orbitLabelEl.className = 'sci-line-label orbit-label';
+      orbitLabelEl.textContent = 'ORBIT · PROPAGATED';
+      labelsContainer.appendChild(orbitLabelEl);
+    }
+
+    const numPoints = currentSelectedOrbitPoints.length;
+    const midpoint = Math.floor(numPoints / 2);
+    const futureLen = numPoints - 1 - midpoint;
+    const fixedIdx = midpoint + Math.max(3, Math.round(futureLen * 0.28));
+
+    const ptA = _sciVecA.copy(currentSelectedOrbitPoints[fixedIdx]).applyMatrix4(equatorialFrame.matrixWorld);
+    const isFacing = ptA.clone().normalize().dot(camDir) >= 0.12;
+    const isUnoccluded = !isBehindEarth(ptA);
+
+    if (isFacing && isUnoccluded) {
+      const sA = new THREE.Vector2();
+      const projA = projectWorldPosition(ptA, sA);
+      if (projA.visible && sA.x >= 24 && sA.x <= window.innerWidth - 24 && sA.y >= 24 && sA.y <= window.innerHeight - 24) {
+        if (labelCollisionManager.tryPlaceLabel(sA.x, sA.y, 115, 13, true)) {
+          orbitLabelEl.style.display = 'block';
+          orbitLabelEl.style.left = `${sA.x.toFixed(1)}px`;
+          orbitLabelEl.style.top = `${sA.y.toFixed(1)}px`;
+          orbitLabelEl.style.transform = 'translate(-50%, -50%)';
+        } else {
+          orbitLabelEl.style.display = 'none';
+        }
+      } else {
+        orbitLabelEl.style.display = 'none';
+      }
+    } else {
+      orbitLabelEl.style.display = 'none';
+    }
+  } else if (orbitLabelEl) {
+    orbitLabelEl.style.display = 'none';
+  }
+
+  // =========================================================================
+  // PRIORITY 3: Observer Geolocation Coordinates Readout
+  // =========================================================================
   let observerCoordEl = document.querySelector<HTMLElement>('#observer-coord-label');
   if (deviceLat !== null && deviceLon !== null && observerWorldPos) {
     const screenPos = new THREE.Vector2();
@@ -1317,38 +1577,200 @@ function updateDomLabels(cameraDistance: number) {
     observerCoordEl.style.display = 'none';
   }
 
-  // 3. Priority Satellite Names
-  if (showSatellites && poolIdx < maxPlacedAirLabels + 8) {
-    const now = new Date();
-    equatorialFrame.updateWorldMatrix(true, false);
+  // =========================================================================
+  // PRIORITY 4: 23.44° Axial Tilt Measurement (23.44° TILT)
+  // =========================================================================
+  let tiltLabelEl = document.querySelector<HTMLElement>('#ref-label-tilt');
+  if (cameraDistance >= 8.5) {
+    if (!tiltLabelEl) {
+      tiltLabelEl = document.createElement('div');
+      tiltLabelEl.id = 'ref-label-tilt';
+      labelsContainer.appendChild(tiltLabelEl);
+    }
+    tiltLabelEl.className = 'sci-line-label tilt-label';
+    tiltLabelEl.textContent = '23.44° TILT';
 
-    for (let index = 0; index < orbiters.length && poolIdx < maxPlacedAirLabels + 8; index++) {
-      const orbiter = orbiters[index];
-      const isSelected = index === selectedSatelliteIndex;
-      const isHovered = orbiter.norad === hoveredSatelliteNorad;
-      const allowSparse = cameraDistance < 13 && index % (cameraDistance < 9 ? 14 : 32) === 0;
-      if (!isSelected && !isHovered && !allowSparse) continue;
+    const halfAngle = obliquity * 0.5;
+    const tiltWorld = _sciVecA.set(-Math.sin(halfAngle) * 4.46, Math.cos(halfAngle) * 4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
 
-      const propagated = satellite.propagate(orbiter.satrec, now);
-      if (!propagated || !propagated.position) continue;
+    if (!isBehindEarth(tiltWorld) && tiltWorld.clone().normalize().dot(camDir) > 0.05) {
+      const sPos = new THREE.Vector2();
+      const proj = projectWorldPosition(tiltWorld, sPos);
+      if (proj.visible && sPos.x > 20 && sPos.x < window.innerWidth - 20 && sPos.y > 20 && sPos.y < window.innerHeight - 20) {
+        if (labelCollisionManager.tryPlaceLabel(sPos.x, sPos.y, 68, 12, false)) {
+          tiltLabelEl.style.display = 'block';
+          tiltLabelEl.style.left = `${sPos.x.toFixed(1)}px`;
+          tiltLabelEl.style.top = `${sPos.y.toFixed(1)}px`;
+          tiltLabelEl.style.transform = 'translate(-50%, -50%)';
+        } else {
+          tiltLabelEl.style.display = 'none';
+        }
+      } else {
+        tiltLabelEl.style.display = 'none';
+      }
+    } else {
+      tiltLabelEl.style.display = 'none';
+    }
+  } else if (tiltLabelEl) {
+    tiltLabelEl.style.display = 'none';
+  }
 
-      const eciPos = eciVector(propagated.position as satellite.EciVec3<number>);
-      const worldPos = eciPos.clone().applyMatrix4(equatorialFrame.matrixWorld);
+  // =========================================================================
+  // PRIORITY 5: Rotational Axis Annotation (ROTATION AXIS & N/S Indicators)
+  // =========================================================================
+  let axisLabelEl = document.querySelector<HTMLElement>('#sci-label-axis');
+  let northLabelEl = document.querySelector<HTMLElement>('#ref-label-north');
+  let southLabelEl = document.querySelector<HTMLElement>('#ref-label-south');
+  if (cameraDistance >= 9.5) {
+    if (!axisLabelEl) {
+      axisLabelEl = document.createElement('div');
+      axisLabelEl.id = 'sci-label-axis';
+      axisLabelEl.className = 'sci-line-label axis-label';
+      axisLabelEl.textContent = 'ROTATION AXIS';
+      labelsContainer.appendChild(axisLabelEl);
+    }
+    if (!northLabelEl) {
+      northLabelEl = document.createElement('div');
+      northLabelEl.id = 'ref-label-north';
+      northLabelEl.className = 'ref-label';
+      northLabelEl.textContent = 'N';
+      labelsContainer.appendChild(northLabelEl);
+    }
+    if (!southLabelEl) {
+      southLabelEl = document.createElement('div');
+      southLabelEl.id = 'ref-label-south';
+      southLabelEl.className = 'ref-label';
+      southLabelEl.textContent = 'S';
+      labelsContainer.appendChild(southLabelEl);
+    }
 
-      const screenVec = worldPos.clone().project(camera);
-      if (screenVec.z > 1.0) continue;
+    const northWorld = _sciVecA.set(0, 4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
+    const northScreen = new THREE.Vector2();
+    const northProj = projectWorldPosition(northWorld, northScreen);
+    if (northProj.visible && !isBehindEarth(northWorld) && northWorld.clone().normalize().dot(camDir) > 0.05) {
+      northLabelEl.style.display = 'block';
+      northLabelEl.style.left = `${northScreen.x.toFixed(1)}px`;
+      northLabelEl.style.top = `${northScreen.y.toFixed(1)}px`;
+      northLabelEl.style.opacity = '0.75';
+    } else {
+      northLabelEl.style.display = 'none';
+    }
 
-      const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
-      const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
+    const southWorld = _sciVecB.set(0, -4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
+    const southScreen = new THREE.Vector2();
+    const southProj = projectWorldPosition(southWorld, southScreen);
+    if (southProj.visible && !isBehindEarth(southWorld) && southWorld.clone().normalize().dot(camDir) > 0.05) {
+      southLabelEl.style.display = 'block';
+      southLabelEl.style.left = `${southScreen.x.toFixed(1)}px`;
+      southLabelEl.style.top = `${southScreen.y.toFixed(1)}px`;
+      southLabelEl.style.opacity = '0.75';
+    } else {
+      southLabelEl.style.display = 'none';
+    }
 
-      const camDir = camera.position.clone().sub(controls.target).normalize();
-      if (worldPos.clone().normalize().dot(camDir) < 0.1) continue;
+    const shaftTip = !isBehindEarth(northWorld) && northWorld.clone().normalize().dot(camDir) > 0.05 ? northWorld : southWorld;
+    const isNorth = shaftTip === northWorld;
 
-      const nameStr = orbiter.name.trim() || `NORAD ${orbiter.norad}`;
-      const widthEstimate = nameStr.length * 6 + 14;
-      const canPlace = labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, 16, isSelected || isHovered);
+    if (!isBehindEarth(shaftTip) && shaftTip.clone().normalize().dot(camDir) > 0.05) {
+      const sPos = new THREE.Vector2();
+      const proj = projectWorldPosition(shaftTip, sPos);
+      if (proj.visible && sPos.x > 20 && sPos.x < window.innerWidth - 20 && sPos.y > 20 && sPos.y < window.innerHeight - 20) {
+        const rootWorld = _sciVecC.set(0, isNorth ? 4.0 : -4.0, 0).applyMatrix4(equatorialFrame.matrixWorld);
+        const sRoot = new THREE.Vector2();
+        projectWorldPosition(rootWorld, sRoot);
 
-      if (canPlace) {
+        const dx = sPos.x - sRoot.x;
+        const dy = sPos.y - sRoot.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const perpX = -dy / len;
+        const perpY = dx / len;
+
+        const offsetX = perpX * 18;
+        const offsetY = perpY * 18;
+
+        if (labelCollisionManager.tryPlaceLabel(sPos.x + offsetX, sPos.y + offsetY, 85, 12, false)) {
+          axisLabelEl.style.display = 'block';
+          axisLabelEl.style.left = `${(sPos.x + offsetX).toFixed(1)}px`;
+          axisLabelEl.style.top = `${(sPos.y + offsetY).toFixed(1)}px`;
+          axisLabelEl.style.transform = 'translate(-50%, -50%)';
+        } else {
+          axisLabelEl.style.display = 'none';
+        }
+      } else {
+        axisLabelEl.style.display = 'none';
+      }
+    } else {
+      axisLabelEl.style.display = 'none';
+    }
+  } else {
+    if (axisLabelEl) axisLabelEl.style.display = 'none';
+    if (northLabelEl) northLabelEl.style.display = 'none';
+    if (southLabelEl) southLabelEl.style.display = 'none';
+  }
+
+  // =========================================================================
+  // PRIORITY 6: Day/Night Boundary Annotation (TERMINATOR)
+  // =========================================================================
+  let termLabelEl = document.querySelector<HTMLElement>('#sci-label-terminator');
+  if (cameraDistance >= 6.8) {
+    if (!termLabelEl) {
+      termLabelEl = document.createElement('div');
+      termLabelEl.id = 'sci-label-terminator';
+      termLabelEl.className = 'sci-line-label terminator-label';
+      termLabelEl.textContent = 'TERMINATOR';
+      labelsContainer.appendChild(termLabelEl);
+    }
+
+    const r = earthRadius + 0.004;
+    _sciVecA.set(solarBasisU.x * r, solarBasisU.y * r, solarBasisU.z * r).applyMatrix4(earth.matrixWorld);
+
+    if (_sciVecA.clone().normalize().dot(camDir) >= 0.15 && !isBehindEarth(_sciVecA)) {
+      const sA = new THREE.Vector2();
+      const projA = projectWorldPosition(_sciVecA, sA);
+      if (projA.visible && sA.x >= 28 && sA.x <= window.innerWidth - 28 && sA.y >= 28 && sA.y <= window.innerHeight - 28) {
+        if (labelCollisionManager.tryPlaceLabel(sA.x, sA.y, 72, 12, false)) {
+          termLabelEl.style.display = 'block';
+          termLabelEl.style.left = `${sA.x.toFixed(1)}px`;
+          termLabelEl.style.top = `${sA.y.toFixed(1)}px`;
+          termLabelEl.style.transform = 'translate(-50%, -50%)';
+        } else {
+          termLabelEl.style.display = 'none';
+        }
+      } else {
+        termLabelEl.style.display = 'none';
+      }
+    } else {
+      termLabelEl.style.display = 'none';
+    }
+  } else if (termLabelEl) {
+    termLabelEl.style.display = 'none';
+  }
+
+  // =========================================================================
+  // PRIORITY 7: Unselected Traffic & Cartographic Country Labels
+  // =========================================================================
+
+  // 7A. Unselected Aircraft
+  const maxPlacedAirLabels = cameraDistance > 16.0 ? 0 : cameraDistance > 9.0 ? 5 : cameraDistance > 5.5 ? 8 : 18;
+  if (showAircraft) {
+    for (let index = 0; index < aircraft.length; index++) {
+      if (index === selectedAircraftIndex) continue;
+      const motion = aircraft[index];
+      const isHovered = motion.truth.icao24 === hoveredIcao;
+
+      if (cameraDistance > 18.0 && !isHovered) continue;
+      if (motion.opacity <= 0 || !motion.inFrustum || !motion.facingCamera) continue;
+      if (motion.lodTier !== 'TIER_B' && !isHovered) continue;
+      if (poolIdx >= maxPlacedAirLabels && !isHovered) continue;
+
+      const callsign = (motion.truth.callsign || motion.truth.icao24).trim();
+      const flAlt = `FL${Math.round(motion.altitude / 304.8)}`;
+      const speedMps = `${Math.round(motion.velocity)} m/s`;
+      const showSubtext = cameraDistance < 6.5 || isHovered;
+      const widthEstimate = callsign.length * 6.5 + 14;
+      const heightEstimate = showSubtext ? 26 : 16;
+
+      if (labelCollisionManager.tryPlaceLabel(motion.screenPos.x, motion.screenPos.y, widthEstimate, heightEstimate, isHovered)) {
         let labelEl = domLabelPool[poolIdx];
         if (!labelEl) {
           labelEl = document.createElement('div');
@@ -1357,54 +1779,87 @@ function updateDomLabels(cameraDistance: number) {
           domLabelPool.push(labelEl);
         }
 
-        labelEl.className = `aircraft-label ${isSelected ? 'selected-label' : ''}`;
+        labelEl.className = 'aircraft-label';
+        labelEl.style.display = 'block';
+        labelEl.style.left = `${motion.screenPos.x}px`;
+        labelEl.style.top = `${motion.screenPos.y}px`;
+        labelEl.style.opacity = String(Math.min(1.0, motion.opacity));
+        labelEl.innerHTML = showSubtext
+          ? `<div class="callsign">${escapeHtml(callsign)}</div><div class="subtext">${flAlt} · ${speedMps}</div>`
+          : `<div class="callsign">${escapeHtml(callsign)}</div>`;
+        poolIdx++;
+      }
+    }
+  }
+
+  // 7B. Unselected Satellites
+  if (showSatellites && poolIdx < maxPlacedAirLabels + 8) {
+    const now = new Date();
+    for (let index = 0; index < orbiters.length && poolIdx < maxPlacedAirLabels + 8; index++) {
+      if (index === selectedSatelliteIndex) continue;
+      const orbiter = orbiters[index];
+      const isHovered = orbiter.norad === hoveredSatelliteNorad;
+      const allowSparse = cameraDistance < 13 && index % (cameraDistance < 9 ? 14 : 32) === 0;
+      if (!isHovered && !allowSparse) continue;
+
+      const propagated = satellite.propagate(orbiter.satrec, now);
+      if (!propagated || !propagated.position) continue;
+
+      const eciPos = eciVector(propagated.position as satellite.EciVec3<number>);
+      const worldPos = eciPos.clone().applyMatrix4(equatorialFrame.matrixWorld);
+      const screenVec = worldPos.clone().project(camera);
+      if (screenVec.z > 1.0 || worldPos.clone().normalize().dot(camDir) < 0.1) continue;
+
+      const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
+      const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
+      const nameStr = orbiter.name.trim() || `NORAD ${orbiter.norad}`;
+      const widthEstimate = nameStr.length * 6 + 14;
+
+      if (labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, 16, isHovered)) {
+        let labelEl = domLabelPool[poolIdx];
+        if (!labelEl) {
+          labelEl = document.createElement('div');
+          labelEl.className = 'aircraft-label';
+          labelsContainer.appendChild(labelEl);
+          domLabelPool.push(labelEl);
+        }
+
+        labelEl.className = 'aircraft-label';
         labelEl.style.display = 'block';
         labelEl.style.left = `${screenX}px`;
         labelEl.style.top = `${screenY}px`;
-        labelEl.style.opacity = isSelected ? '1.0' : '0.80';
+        labelEl.style.opacity = '0.80';
         labelEl.innerHTML = `<div class="callsign" style="color: #6acbfb;">${escapeHtml(nameStr)}</div>`;
         poolIdx++;
       }
     }
   }
 
-  // 4. Natural Earth Geographic Country Labels (Cartographic / Restrained)
+  // 7C. Cartographic Country Labels
   const maxCountryLabels = cameraDistance > 20.0 ? 12 : cameraDistance > 13.0 ? 24 : cameraDistance > 8.0 ? 42 : 65;
   const maxCountryTier = cameraDistance > 19.0 ? 1 : cameraDistance > 10.5 ? 2 : 3;
-
-  earth.updateWorldMatrix(true, false);
-  const camDir = camera.position.clone().sub(controls.target).normalize();
   let countryPlacedCount = 0;
 
   for (let index = 0; index < COUNTRY_LABELS.length && countryPlacedCount < maxCountryLabels; index++) {
     const country = COUNTRY_LABELS[index];
     if (country.tier > maxCountryTier) continue;
 
-    // Stable label position derived from Natural Earth / ISO geography
     const localPos = latLonToVector3(country.lat, country.lon, earthRadius + 0.005);
     const worldPos = localPos.clone().applyMatrix4(earth.matrixWorld);
-
-    // Reject labels on far side of globe or behind the Earth
     const facing = worldPos.clone().normalize().dot(camDir);
-    if (facing < 0.12) continue;
-    if (isBehindEarth(worldPos)) continue;
+    if (facing < 0.12 || isBehindEarth(worldPos)) continue;
 
     const screenVec = worldPos.clone().project(camera);
     if (screenVec.z > 1.0) continue;
 
     const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
     const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
-
     if (screenX < -30 || screenX > window.innerWidth + 30 || screenY < -30 || screenY > window.innerHeight + 30) continue;
 
-    // Subtle collision box to avoid visual clutter with aircraft, satellites, and other countries
     const widthEstimate = country.name.length * 6.0 + 8;
     const heightEstimate = 12;
+    if (!labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, heightEstimate, false)) continue;
 
-    const canPlace = labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, heightEstimate, false);
-    if (!canPlace) continue;
-
-    // Fade near limb smoothly
     const limbFactor = THREE.MathUtils.clamp((facing - 0.12) / 0.32, 0, 1);
     const baseOpacity = country.tier === 1 ? 0.72 : country.tier === 2 ? 0.58 : 0.46;
     const opacity = baseOpacity * limbFactor;
@@ -1432,76 +1887,43 @@ function updateDomLabels(cameraDistance: number) {
     domLabelPool[i].style.display = 'none';
   }
 
-  // 5. Astronomical Reference DOM Labels (N, S, 23.44° Axial Tilt)
-  const tiltZoomFactor = THREE.MathUtils.clamp((cameraDistance - 5.5) / (12.0 - 5.5), 0, 1);
-  const axisLabelZoomFactor = THREE.MathUtils.clamp((cameraDistance - 5.0) / (10.0 - 5.0), 0, 1);
+  // =========================================================================
+  // PRIORITY 8: Ecliptic Reference Plane Annotation (ECLIPTIC)
+  // =========================================================================
+  let eclipticLabelEl = document.querySelector<HTMLElement>('#sci-label-ecliptic');
+  // Visible ONLY at Full Earth / 3/4 Earth scale (cameraDistance >= 10.0)
+  if (cameraDistance >= 10.0) {
+    if (!eclipticLabelEl) {
+      eclipticLabelEl = document.createElement('div');
+      eclipticLabelEl.id = 'sci-label-ecliptic';
+      eclipticLabelEl.className = 'sci-line-label ecliptic-label';
+      eclipticLabelEl.textContent = 'ECLIPTIC';
+      labelsContainer.appendChild(eclipticLabelEl);
+    }
 
-  let northLabelEl = document.querySelector<HTMLElement>('#ref-label-north');
-  let southLabelEl = document.querySelector<HTMLElement>('#ref-label-south');
-  let tiltLabelEl = document.querySelector<HTMLElement>('#ref-label-tilt');
+    const r = 4.28;
+    _sciVecA.set(r, 0, 0).applyAxisAngle(new THREE.Vector3(0, 0, 1), obliquity).applyMatrix4(equatorialFrame.matrixWorld);
 
-  if (!northLabelEl) {
-    northLabelEl = document.createElement('div');
-    northLabelEl.id = 'ref-label-north';
-    northLabelEl.className = 'ref-label';
-    northLabelEl.textContent = 'N';
-    labelsContainer.appendChild(northLabelEl);
-  }
-  if (!southLabelEl) {
-    southLabelEl = document.createElement('div');
-    southLabelEl.id = 'ref-label-south';
-    southLabelEl.className = 'ref-label';
-    southLabelEl.textContent = 'S';
-    labelsContainer.appendChild(southLabelEl);
-  }
-  if (!tiltLabelEl) {
-    tiltLabelEl = document.createElement('div');
-    tiltLabelEl.id = 'ref-label-tilt';
-    tiltLabelEl.className = 'ref-label tilt-angle';
-    tiltLabelEl.textContent = '23.44°';
-    labelsContainer.appendChild(tiltLabelEl);
-  }
-
-  equatorialFrame.updateWorldMatrix(true, false);
-
-  // North Pole
-  const northWorld = new THREE.Vector3(0, 4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
-  const northScreen = new THREE.Vector2();
-  const northProj = projectWorldPosition(northWorld, northScreen);
-  if (northProj.visible && !isBehindEarth(northWorld) && axisLabelZoomFactor > 0.01) {
-    northLabelEl.style.display = 'block';
-    northLabelEl.style.left = `${northScreen.x}px`;
-    northLabelEl.style.top = `${northScreen.y}px`;
-    northLabelEl.style.opacity = (0.75 * axisLabelZoomFactor).toFixed(2);
-  } else {
-    northLabelEl.style.display = 'none';
-  }
-
-  // South Pole
-  const southWorld = new THREE.Vector3(0, -4.46, 0).applyMatrix4(equatorialFrame.matrixWorld);
-  const southScreen = new THREE.Vector2();
-  const southProj = projectWorldPosition(southWorld, southScreen);
-  if (southProj.visible && !isBehindEarth(southWorld) && axisLabelZoomFactor > 0.01) {
-    southLabelEl.style.display = 'block';
-    southLabelEl.style.left = `${southScreen.x}px`;
-    southLabelEl.style.top = `${southScreen.y}px`;
-    southLabelEl.style.opacity = (0.75 * axisLabelZoomFactor).toFixed(2);
-  } else {
-    southLabelEl.style.display = 'none';
-  }
-
-  // 23.44° Tilt Angle Label (midpoint of tilt arc)
-  const halfAngle = obliquity * 0.5;
-  const tiltWorld = new THREE.Vector3(-Math.sin(halfAngle) * 4.44, Math.cos(halfAngle) * 4.44, 0).applyMatrix4(equatorialFrame.matrixWorld);
-  const tiltScreen = new THREE.Vector2();
-  const tiltProj = projectWorldPosition(tiltWorld, tiltScreen);
-  if (tiltProj.visible && !isBehindEarth(tiltWorld) && tiltZoomFactor > 0.01) {
-    tiltLabelEl.style.display = 'block';
-    tiltLabelEl.style.left = `${tiltScreen.x}px`;
-    tiltLabelEl.style.top = `${tiltScreen.y}px`;
-    tiltLabelEl.style.opacity = (0.75 * tiltZoomFactor).toFixed(2);
-  } else {
-    tiltLabelEl.style.display = 'none';
+    if (!isBehindEarth(_sciVecA) && _sciVecA.clone().normalize().dot(camDir) >= 0.15) {
+      const sA = new THREE.Vector2();
+      const projA = projectWorldPosition(_sciVecA, sA);
+      if (projA.visible && sA.x >= 28 && sA.x <= window.innerWidth - 28 && sA.y >= 28 && sA.y <= window.innerHeight - 28) {
+        if (labelCollisionManager.tryPlaceLabel(sA.x, sA.y, 52, 12, false)) {
+          eclipticLabelEl.style.display = 'block';
+          eclipticLabelEl.style.left = `${sA.x.toFixed(1)}px`;
+          eclipticLabelEl.style.top = `${sA.y.toFixed(1)}px`;
+          eclipticLabelEl.style.transform = 'translate(-50%, -50%)';
+        } else {
+          eclipticLabelEl.style.display = 'none';
+        }
+      } else {
+        eclipticLabelEl.style.display = 'none';
+      }
+    } else {
+      eclipticLabelEl.style.display = 'none';
+    }
+  } else if (eclipticLabelEl) {
+    eclipticLabelEl.style.display = 'none';
   }
 }
 
@@ -1946,29 +2368,34 @@ function drawOrbit(index: number) {
   }
 
   if (points.length < 2) return;
+  currentSelectedOrbitPoints = points.slice();
 
   const orbitGroup = new THREE.Group();
 
-  // LAYER A — OCCLUDED / CONTEXT ORBIT
+  // LAYER A — OCCLUDED / CONTEXT ORBIT (Screen-space 0.85 px)
   // Full propagated trajectory visible through the Earth with thin sparse dash treatment.
   // Provides complete orbital context without competing with geography.
-  const fullGeometry = new THREE.BufferGeometry().setFromPoints(points);
-  const contextOrbit = new THREE.Line(
-    fullGeometry,
-    new THREE.LineDashedMaterial({
-      color: 0x5fa8c8,
+  const fullGeometry = new LineGeometry();
+  fullGeometry.setPositions(toFlatPoints(points));
+  const contextOrbitMat = registerFatLineMaterial(
+    new LineMaterial({
+      color: 0x488ca8,
+      linewidth: 0.85,
       transparent: true,
-      opacity: 0.07,
-      dashSize: 0.012,
-      gapSize: 0.050,
+      opacity: 0.06,
+      dashed: true,
+      dashScale: 1.0,
+      dashSize: 0.06,
+      gapSize: 0.09,
       depthWrite: false,
       depthTest: false,
     })
   );
+  const contextOrbit = new Line2(fullGeometry, contextOrbitMat);
   contextOrbit.computeLineDistances();
   orbitGroup.add(contextOrbit);
 
-  // LAYER B — VISIBLE DEPTH-TESTED ORBIT
+  // LAYER B — VISIBLE DEPTH-TESTED ORBIT (Trajectory Language: Technical Regular Dashes)
   // Camera-facing portion naturally dominates via depth testing.
   // Subtle past vs future split around current UTC (midpoint index).
   const midpoint = Math.floor(points.length / 2);
@@ -1976,42 +2403,50 @@ function drawOrbit(index: number) {
   const futurePoints = points.slice(midpoint);
 
   if (pastPoints.length >= 2) {
-    const pastGeo = new THREE.BufferGeometry().setFromPoints(pastPoints);
-    const pastOrbit = new THREE.Line(
-      pastGeo,
-      new THREE.LineDashedMaterial({
-        color: 0x5a9ebf,
+    const pastGeo = new LineGeometry();
+    pastGeo.setPositions(toFlatPoints(pastPoints));
+    const pastOrbitMat = registerFatLineMaterial(
+      new LineMaterial({
+        color: 0x68badc,
+        linewidth: 1.4,
         transparent: true,
-        opacity: 0.22,
-        dashSize: 0.018,
-        gapSize: 0.042,
+        opacity: 0.32,
+        dashed: true,
+        dashScale: 1.0,
+        dashSize: 0.06,
+        gapSize: 0.07,
         depthWrite: false,
         depthTest: true,
       })
     );
+    const pastOrbit = new Line2(pastGeo, pastOrbitMat);
     pastOrbit.computeLineDistances();
     orbitGroup.add(pastOrbit);
   }
 
   if (futurePoints.length >= 2) {
-    const futureGeo = new THREE.BufferGeometry().setFromPoints(futurePoints);
-    const futureOrbit = new THREE.Line(
-      futureGeo,
-      new THREE.LineDashedMaterial({
-        color: 0x75bdd8,
+    const futureGeo = new LineGeometry();
+    futureGeo.setPositions(toFlatPoints(futurePoints));
+    const futureOrbitMat = registerFatLineMaterial(
+      new LineMaterial({
+        color: 0x8ee0ff,
+        linewidth: 1.5,
         transparent: true,
-        opacity: 0.32,
-        dashSize: 0.020,
-        gapSize: 0.038,
+        opacity: 0.48,
+        dashed: true,
+        dashScale: 1.0,
+        dashSize: 0.07,
+        gapSize: 0.06,
         depthWrite: false,
         depthTest: true,
       })
     );
-    futureOrbit.computeLineDistances();
-    orbitGroup.add(futureOrbit);
+    const futureOrbitLine = new Line2(futureGeo, futureOrbitMat);
+    futureOrbitLine.computeLineDistances();
+    orbitGroup.add(futureOrbitLine);
   }
 
-  // CURRENT-POSITION EMPHASIS
+  // CURRENT-POSITION EMPHASIS (Trajectory Language: Prominent Technical Dashes, 2.0 px)
   // Restrained temporal window (±6% of orbital period around current UTC)
   const windowSamples = Math.max(3, Math.round(numSamples * 0.06));
   const nearStart = Math.max(0, midpoint - windowSamples);
@@ -2019,19 +2454,23 @@ function drawOrbit(index: number) {
   const nearPoints = points.slice(nearStart, nearEnd);
 
   if (nearPoints.length >= 2) {
-    const nearGeo = new THREE.BufferGeometry().setFromPoints(nearPoints);
-    const nearOrbit = new THREE.Line(
-      nearGeo,
-      new THREE.LineDashedMaterial({
-        color: 0x9be0f7,
+    const nearGeo = new LineGeometry();
+    nearGeo.setPositions(toFlatPoints(nearPoints));
+    const nearOrbitMat = registerFatLineMaterial(
+      new LineMaterial({
+        color: 0xb6f0ff,
+        linewidth: 2.0,
         transparent: true,
-        opacity: 0.60,
-        dashSize: 0.024,
-        gapSize: 0.028,
+        opacity: 0.85,
+        dashed: true,
+        dashScale: 1.0,
+        dashSize: 0.08,
+        gapSize: 0.04,
         depthWrite: false,
         depthTest: true,
       })
     );
+    const nearOrbit = new Line2(nearGeo, nearOrbitMat);
     nearOrbit.computeLineDistances();
     orbitGroup.add(nearOrbit);
   }
@@ -2175,6 +2614,10 @@ function updateMotionDebugPanel() {
     <dt>GMST DELTA / ELAPSED</dt><dd>${gmstDeltaDeg.toFixed(5)}° / ${landmarkProbeElapsedSec.toFixed(1)}s</dd>
     <dt>EARTH ROT ANGLE</dt><dd>${currentEarthOrientation.rotAngleDeg.toFixed(4)}°</dd>
     <dt>EARTH FIXED QUAT</dt><dd>${qStr}</dd>
+    <div class="debug-divider"></div>
+    <dt>SOLAR STATE</dt><dd>CALCULATED · UTC</dd>
+    <dt>SUBSOLAR POINT</dt><dd>${currentSolarState.subsolarLatitudeDeg >= 0 ? '+' : ''}${currentSolarState.subsolarLatitudeDeg.toFixed(2)}°, ${currentSolarState.subsolarLongitudeDeg >= 0 ? '+' : ''}${currentSolarState.subsolarLongitudeDeg.toFixed(2)}°</dd>
+    <dt>SOLAR RA / DEC</dt><dd>${(THREE.MathUtils.radToDeg(currentSolarState.rightAscensionRad) / 15).toFixed(2)}h / ${currentSolarState.declinationRad >= 0 ? '+' : ''}${THREE.MathUtils.radToDeg(currentSolarState.declinationRad).toFixed(2)}°</dd>
     <div class="debug-divider"></div>
     <dt>CAMERA MODE</dt><dd>${cameraMode}</dd>
     <dt>CAMERA DISTANCE</dt><dd>${cameraDist.toFixed(2)} Earth Radii</dd>
@@ -2486,6 +2929,11 @@ function render(now: number) {
   const earthOrientationDate = new Date(earthSimulationTimeMs(nowDate.getTime()));
   updateEarthOrientation(earthOrientationDate);
 
+  const cameraDist = camera.position.distanceTo(controls.target);
+
+  // Authoritative Astronomical Solar Ephemeris & Day/Night Terminator Update (Real UTC)
+  updateSolarSystem(nowDate, cameraDist);
+
   // 2. Camera animation slerp (if locating)
   if (cameraMode === 'LOCATING' && locateAnim) {
     const elapsed = performance.now() - locateAnim.startTime;
@@ -2532,20 +2980,19 @@ function render(now: number) {
   selectedSatGlyph.lookAt(camera.position);
 
   // 6. Astronomical Reference Instrument Zoom Fading
-  const cameraDist = camera.position.distanceTo(controls.target);
   const eclipticZoomFactor = THREE.MathUtils.clamp((cameraDist - 7.0) / (15.0 - 7.0), 0, 1);
   const tiltZoomFactor = THREE.MathUtils.clamp((cameraDist - 5.5) / (12.0 - 5.5), 0, 1);
-  const axisZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.5) / (10.0 - 4.5), 0.15, 1);
+  const axisZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.5) / (10.0 - 4.5), 0.20, 1);
 
-  eclipticRingMat.opacity = 0.08 * eclipticZoomFactor;
+  eclipticRingMat.opacity = 0.09 * eclipticZoomFactor;
   eclipticRingLine.visible = eclipticRingMat.opacity > 0.005;
 
-  eclipticNormalMat.opacity = 0.20 * tiltZoomFactor;
-  tiltMat.opacity = 0.28 * tiltZoomFactor;
+  eclipticNormalMat.opacity = 0.22 * tiltZoomFactor;
+  tiltMat.opacity = 0.50 * tiltZoomFactor;
   tiltArcLine.visible = tiltMat.opacity > 0.005;
   eclipticNormalLine.visible = eclipticNormalMat.opacity > 0.005;
 
-  axisMat.opacity = 0.24 * axisZoomFactor;
+  axisMat.opacity = 0.38 * axisZoomFactor;
   axisLine.visible = axisMat.opacity > 0.005;
 
   // 7. Screen-Space DOM Label Overlay
@@ -2573,4 +3020,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  for (const mat of fatLineMaterials) {
+    mat.resolution.set(window.innerWidth, window.innerHeight);
+  }
 });
