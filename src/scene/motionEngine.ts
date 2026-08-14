@@ -216,6 +216,7 @@ const _tempVecWorldA = new THREE.Vector3();
 const _tempVecWorldB = new THREE.Vector3();
 const _tempNdcA = new THREE.Vector3();
 const _tempNdcB = new THREE.Vector3();
+const _tempCameraUnit = new THREE.Vector3();
 
 /**
  * Computes projected screen-space displacement in pixels per second using
@@ -232,9 +233,10 @@ export function calculateWorldScreenVelocity(
   lonDeg: number,
   altMeters: number,
   speedMps: number,
-  trackDeg: number
+  trackDeg: number,
+  screenTarget: THREE.Vector2
 ): { screenSpeedPxPerSec: number; isFacingCamera: boolean; isInFrustum: boolean; screenPos: THREE.Vector2 } {
-  const screenPos = new THREE.Vector2(-9999, -9999);
+  const screenPos = screenTarget.set(-9999, -9999);
   const r1 = earthRadiusScene + (Math.max(0, altMeters) / 1000) * scaleFactor + 0.008;
 
   // Local earth coordinates
@@ -246,7 +248,7 @@ export function calculateWorldScreenVelocity(
   screenPos.set(((1 + _tempNdcA.x) * viewportWidth) / 2, ((1 - _tempNdcA.y) * viewportHeight) / 2);
 
   const camWorldPos = _tempVecWorldB.setFromMatrixPosition(camera.matrixWorld);
-  const facing = _tempVecWorldA.clone().normalize().dot(camWorldPos.clone().normalize()) > 0;
+  const facing = _tempCameraUnit.copy(_tempVecWorldA).normalize().dot(camWorldPos.normalize()) > 0;
   const inFrustum = Math.abs(_tempNdcA.x) <= 1.15 && Math.abs(_tempNdcA.y) <= 1.15 && _tempNdcA.z <= 1.0;
 
   if (speedMps <= 0) {
@@ -259,9 +261,10 @@ export function calculateWorldScreenVelocity(
   _tempVecWorldB.copy(_tempVecLocalB).applyMatrix4(earthMatrixWorld);
   _tempNdcB.copy(_tempVecWorldB).project(camera);
 
-  const screenPosNext = new THREE.Vector2(((1 + _tempNdcB.x) * viewportWidth) / 2, ((1 - _tempNdcB.y) * viewportHeight) / 2);
-  const dx = screenPosNext.x - screenPos.x;
-  const dy = screenPosNext.y - screenPos.y;
+  const nextX = ((1 + _tempNdcB.x) * viewportWidth) / 2;
+  const nextY = ((1 - _tempNdcB.y) * viewportHeight) / 2;
+  const dx = nextX - screenPos.x;
+  const dy = nextY - screenPos.y;
   const screenSpeedPxPerSec = Math.hypot(dx, dy);
 
   return { screenSpeedPxPerSec, isFacingCamera: facing, isInFrustum: inFrustum, screenPos };
