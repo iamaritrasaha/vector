@@ -138,6 +138,23 @@ button {
   color: var(--text-muted);
 }
 
+.runtime-status {
+  position: fixed;
+  top: max(72px, calc(env(safe-area-inset-top) + 56px));
+  left: 50%;
+  z-index: 30;
+  transform: translateX(-50%);
+  padding: 7px 10px;
+  border: 1px solid rgba(180, 221, 235, 0.22);
+  background: rgba(5, 10, 14, 0.82);
+  color: #b9d8e3;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
 /* HUD TELEMETRY COUNTER (Bottom Left) */
 .telemetry-hud {
   position: fixed;
@@ -540,8 +557,8 @@ button {
 /* RESPONSIVE LAYOUT (Mobile & Tablet) */
 @media (max-width: 680px) {
   .masthead {
-    top: 16px;
-    left: 16px;
+    top: max(16px, env(safe-area-inset-top));
+    left: max(16px, env(safe-area-inset-left));
   }
   
   .masthead h1 {
@@ -554,8 +571,8 @@ button {
   }
 
   .clock {
-    top: 16px;
-    right: 16px;
+    top: max(16px, env(safe-area-inset-top));
+    right: max(16px, env(safe-area-inset-right));
   }
 
   .clock time {
@@ -563,15 +580,16 @@ button {
   }
 
   .telemetry-hud {
-    bottom: 16px;
-    left: 16px;
+    bottom: max(74px, calc(env(safe-area-inset-bottom) + 60px));
+    left: max(16px, env(safe-area-inset-left));
     font-size: 8px;
+    gap: 9px;
   }
 
   .earth-rate-control {
     position: fixed;
-    left: 16px;
-    bottom: 50px;
+    left: max(16px, env(safe-area-inset-left));
+    bottom: max(46px, calc(env(safe-area-inset-bottom) + 34px));
   }
 
   .earth-rate-state {
@@ -579,15 +597,17 @@ button {
   }
 
   .controls-toolbar {
-    bottom: 16px;
-    right: 16px;
+    bottom: max(16px, env(safe-area-inset-bottom));
+    right: max(16px, env(safe-area-inset-right));
     gap: 4px;
+    max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right));
   }
 
   .control-btn {
-    height: 32px;
-    padding: 0 9px;
-    font-size: 8px;
+    min-height: 36px;
+    height: 36px;
+    padding: 0 8px;
+    font-size: 8.5px;
   }
 
   .status-drawer {
@@ -596,15 +616,33 @@ button {
 
   .inspector {
     top: auto;
-    bottom: 60px;
-    left: 16px;
-    right: 16px;
+    bottom: max(60px, calc(env(safe-area-inset-bottom) + 44px));
+    left: max(16px, env(safe-area-inset-left));
+    right: max(16px, env(safe-area-inset-right));
     width: auto;
   }
 
   .about-panel {
     padding: 20px;
     width: calc(100vw - 24px);
+  }
+}
+
+@media (max-width: 440px) and (orientation: portrait) {
+  .masthead .tagline,
+  .masthead .sub-tag,
+  .clock .label,
+  .telemetry-hud .telemetry-item:nth-child(5),
+  .telemetry-hud .telemetry-divider:nth-child(6) {
+    display: none;
+  }
+
+  .controls-toolbar {
+    gap: 3px;
+  }
+
+  .control-btn {
+    padding: 0 7px;
   }
 }
 
@@ -780,6 +818,13 @@ button {
   color: #a2cadc;
   animation: termTelemetrySignal 3.0s ease-in-out infinite;
   animation-delay: -0.8s;
+}
+
+.sci-line-label.subsolar-label {
+  font-size: 8px;
+  letter-spacing: 0.11em;
+  color: #c9f1fb;
+  opacity: 0.84;
 }
 
 .sci-line-label.axis-label {

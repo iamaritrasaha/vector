@@ -53,6 +53,17 @@ const canvas = document.querySelector<HTMLCanvasElement>('#vector-canvas')!;
 const labelsContainer = document.querySelector<HTMLElement>('#labels-container')!;
 const $ = <T extends HTMLElement>(s: string) => document.querySelector<T>(s)!;
 
+type RenderQuality = 'DESKTOP_HIGH' | 'DESKTOP_BALANCED' | 'MOBILE';
+const coarsePointerMedia = window.matchMedia('(pointer: coarse)');
+function detectRenderQuality(): RenderQuality {
+  const smallViewport = Math.min(window.innerWidth, window.innerHeight) < 680;
+  const limitedCpu = (navigator.hardwareConcurrency ?? 8) <= 4;
+  if (coarsePointerMedia.matches && (smallViewport || window.devicePixelRatio >= 2)) return 'MOBILE';
+  return limitedCpu || window.devicePixelRatio > 1.8 ? 'DESKTOP_BALANCED' : 'DESKTOP_HIGH';
+}
+let renderQuality = detectRenderQuality();
+const isCoarsePointer = () => coarsePointerMedia.matches;
+
 const earthRadius = 4.0;
 const scale = earthRadius / 6371;
 
@@ -192,7 +203,7 @@ function updateEarthOrientation(date: Date) {
 }
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.7));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, renderQuality === 'MOBILE' ? 1.35 : renderQuality === 'DESKTOP_BALANCED' ? 1.5 : 1.7));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setAnimationLoop(render);
 
@@ -203,6 +214,12 @@ controls.dampingFactor = 0.06;
 controls.minDistance = 4.6;
 controls.maxDistance = 38.0;
 controls.target.set(0, 0, 0);
+if (isCoarsePointer()) {
+  controls.enablePan = false;
+  controls.zoomSpeed = 0.72;
+  controls.rotateSpeed = 0.48;
+  canvas.style.touchAction = 'none';
+}
 
 /**
  * Smoothly zoom-adaptive OrbitControls sensitivity and damping.
@@ -236,6 +253,9 @@ function computeAdaptiveControlsSensitivity(cameraDist: number): { rotateSpeed: 
     dampingFactor = 0.06;
   }
 
+  if (isCoarsePointer()) {
+    return { rotateSpeed: rotateSpeed * 0.58, dampingFactor: Math.max(dampingFactor, 0.085) };
+  }
   return { rotateSpeed, dampingFactor };
 }
 
@@ -267,7 +287,7 @@ canvas.addEventListener('touchstart', (e) => {
 }, { passive: true });
 
 // Sparse Physical Starfield
-const starCount = 1000;
+const starCount = renderQuality === 'MOBILE' ? 360 : renderQuality === 'DESKTOP_BALANCED' ? 650 : 1000;
 const starGeometry = new THREE.BufferGeometry();
 const starPositions = new Float32Array(starCount * 3);
 for (let i = 0; i < starCount; i++) {
@@ -432,17 +452,18 @@ function registerFatLineMaterial<T extends LineMaterial>(mat: T): T {
   return mat;
 }
 
-// Subtle Scientific Day/Night Geometric Terminator Line (Physical Boundary Language: Continuous Solid Line, 1.25 px)
-const TERMINATOR_SAMPLES = 144;
+// Quiet day/night boundary. Illumination is the primary day/night explanation;
+// this line is intentionally too subdued to read as a trajectory.
+const TERMINATOR_SAMPLES = 96;
 const terminatorPositions = new Float32Array((TERMINATOR_SAMPLES + 1) * 3);
 const terminatorGeo = new LineGeometry();
 terminatorGeo.setPositions(terminatorPositions);
 const terminatorMat = registerFatLineMaterial(
   new LineMaterial({
     color: 0x9dc4d8,
-    linewidth: 1.25,
+    linewidth: 1.0,
     transparent: true,
-    opacity: 0.22,
+    opacity: 0.075,
     depthTest: true,
     depthWrite: false,
     dashed: false,
@@ -451,33 +472,115 @@ const terminatorMat = registerFatLineMaterial(
 const terminatorLine = new Line2(terminatorGeo, terminatorMat);
 earth.add(terminatorLine);
 
-// Subsolar Point Instrument Marker (Overhead Sun location, zoom-adaptive visibility)
-const subsolarPts: THREE.Vector3[] = [];
-for (let i = 0; i <= 16; i++) {
-  const theta = (i / 16) * Math.PI * 2;
-  subsolarPts.push(new THREE.Vector3(Math.cos(theta) * 0.024, 0, Math.sin(theta) * 0.024));
-}
-const subsolarRingGeo = new THREE.BufferGeometry().setFromPoints(subsolarPts);
-const subsolarRingMat = new THREE.LineBasicMaterial({
-  color: 0xb0deee,
+// Real UTC subsolar ground track: geographic samples from the solar ephemeris,
+// not a latitude circle.  It is Earth-fixed only while the Earth display is real-time.
+const SOLAR_TRACK_STEP_MS = 10 * 60 * 1000;
+const SOLAR_TRACK_HALF_WINDOW_MS = 6 * 60 * 60 * 1000;
+const SOLAR_TRACK_SAMPLE_COUNT = (SOLAR_TRACK_HALF_WINDOW_MS * 2) / SOLAR_TRACK_STEP_MS + 1;
+const solarTrackPositions = new Float32Array(SOLAR_TRACK_SAMPLE_COUNT * 3);
+const solarTrackColors = new Float32Array(SOLAR_TRACK_SAMPLE_COUNT * 3);
+const solarTrackGeo = new THREE.BufferGeometry();
+solarTrackGeo.setAttribute('position', new THREE.BufferAttribute(solarTrackPositions, 3));
+solarTrackGeo.setAttribute('color', new THREE.BufferAttribute(solarTrackColors, 3));
+const solarTrackPoints = new THREE.Points(
+  solarTrackGeo,
+  new THREE.PointsMaterial({
+    size: 3.0,
+    sizeAttenuation: false,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.72,
+    depthWrite: false,
+    depthTest: true,
+  })
+);
+solarTrackPoints.renderOrder = 2;
+earth.add(solarTrackPoints);
+
+const solarTrackCurrentPositions = new Float32Array(5 * 3);
+const solarTrackCurrentGeo = new LineGeometry();
+solarTrackCurrentGeo.setPositions(solarTrackCurrentPositions);
+const solarTrackCurrentMat = registerFatLineMaterial(
+  new LineMaterial({
+    color: 0xc3effa,
+    linewidth: 1.45,
+    transparent: true,
+    opacity: 0.72,
+    depthWrite: false,
+    depthTest: true,
+    dashed: false,
+  })
+);
+const solarTrackCurrentLine = new Line2(solarTrackCurrentGeo, solarTrackCurrentMat);
+earth.add(solarTrackCurrentLine);
+const solarTrackGroup = new THREE.Group();
+solarTrackGroup.add(solarTrackPoints, solarTrackCurrentLine);
+earth.add(solarTrackGroup);
+
+// A deliberately small point: the Sun is directly overhead here now.
+const subsolarMarkerGeo = new THREE.BufferGeometry();
+subsolarMarkerGeo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
+const subsolarMarkerMat = new THREE.PointsMaterial({
+  color: 0xd6f7ff,
+  size: 4.5,
+  sizeAttenuation: false,
   transparent: true,
-  opacity: 0.42,
+  opacity: 0.88,
   depthTest: true,
   depthWrite: false,
 });
-const subsolarMarker = new THREE.Line(subsolarRingGeo, subsolarRingMat);
+const subsolarMarker = new THREE.Points(subsolarMarkerGeo, subsolarMarkerMat);
+subsolarMarker.renderOrder = 3;
 earth.add(subsolarMarker);
 
 // Authoritative Solar State Manager
 let currentSolarState: SolarState = calculateSolarState(Date.now());
 const currentSunWorldDirection = new THREE.Vector3(0, 0, 1);
 let lastSolarEphemerisUpdateMs = 0;
+let lastSolarTrackUpdateMs = 0;
 
 const solarEarthInv = new THREE.Matrix4();
 const solarLocalSun = new THREE.Vector3();
 const solarBasisU = new THREE.Vector3();
 const solarBasisV = new THREE.Vector3();
 const solarRefAxis = new THREE.Vector3();
+const solarTrackScratch = new THREE.Vector3();
+
+function updateSolarGroundTrack(realUtcMs: number) {
+  if (realUtcMs - lastSolarTrackUpdateMs < 5 * 60 * 1000 && lastSolarTrackUpdateMs !== 0) return;
+  lastSolarTrackUpdateMs = realUtcMs;
+
+  for (let index = 0; index < SOLAR_TRACK_SAMPLE_COUNT; index++) {
+    const offsetMs = index * SOLAR_TRACK_STEP_MS - SOLAR_TRACK_HALF_WINDOW_MS;
+    const state = calculateSolarState(realUtcMs + offsetMs);
+    latLonToVector3(state.subsolarLatitudeDeg, state.subsolarLongitudeDeg, earthRadius + 0.012, solarTrackScratch);
+    const offset = index * 3;
+    solarTrackPositions[offset] = solarTrackScratch.x;
+    solarTrackPositions[offset + 1] = solarTrackScratch.y;
+    solarTrackPositions[offset + 2] = solarTrackScratch.z;
+
+    const currentWeight = Math.max(0, 1 - Math.abs(offsetMs) / (2 * SOLAR_TRACK_STEP_MS));
+    const future = offsetMs > 0;
+    solarTrackColors[offset] = future ? 0.31 : 0.38;
+    solarTrackColors[offset + 1] = future ? 0.59 : 0.67;
+    solarTrackColors[offset + 2] = future ? 0.67 : 0.76;
+    solarTrackColors[offset] += currentWeight * 0.42;
+    solarTrackColors[offset + 1] += currentWeight * 0.31;
+    solarTrackColors[offset + 2] += currentWeight * 0.22;
+  }
+  solarTrackGeo.attributes.position.needsUpdate = true;
+  solarTrackGeo.attributes.color.needsUpdate = true;
+
+  for (let index = 0; index < 5; index++) {
+    const offsetMs = (index - 2) * SOLAR_TRACK_STEP_MS;
+    const state = calculateSolarState(realUtcMs + offsetMs);
+    latLonToVector3(state.subsolarLatitudeDeg, state.subsolarLongitudeDeg, earthRadius + 0.015, solarTrackScratch);
+    solarTrackCurrentPositions[index * 3] = solarTrackScratch.x;
+    solarTrackCurrentPositions[index * 3 + 1] = solarTrackScratch.y;
+    solarTrackCurrentPositions[index * 3 + 2] = solarTrackScratch.z;
+  }
+  solarTrackCurrentGeo.setPositions(solarTrackCurrentPositions);
+}
 
 function updateSolarSystem(realUtcDate: Date, cameraDist: number) {
   const realUtcMs = realUtcDate.getTime();
@@ -519,15 +622,20 @@ function updateSolarSystem(realUtcDate: Date, cameraDist: number) {
 
   // Zoom-aware terminator line opacity reduction at close zoom
   const terminatorZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.6) / (7.0 - 4.6), 0.70, 1.0);
-  terminatorMat.opacity = 0.22 * terminatorZoomFactor;
+  terminatorMat.opacity = 0.075 * terminatorZoomFactor;
 
   // 3. Update subsolar marker position & zoom-adaptive fading directly from solarLocalSun
-  subsolarMarker.position.copy(solarLocalSun).multiplyScalar(earthRadius + 0.005);
-  subsolarMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), solarLocalSun);
+  subsolarMarker.position.copy(solarLocalSun).multiplyScalar(earthRadius + 0.014);
+  const subsolarZoomFactor = THREE.MathUtils.clamp((cameraDist - 4.8) / (7.0 - 4.8), 0.35, 1);
+  subsolarMarkerMat.opacity = (0.76 + Math.sin(realUtcMs / 2200) * 0.12) * subsolarZoomFactor;
+  subsolarMarker.visible = subsolarMarkerMat.opacity > 0.01;
 
-  const subsolarZoomFactor = THREE.MathUtils.clamp((cameraDist - 6.0) / (10.0 - 6.0), 0, 1);
-  subsolarRingMat.opacity = 0.42 * subsolarZoomFactor;
-  subsolarMarker.visible = subsolarRingMat.opacity > 0.01;
+  // Geographic longitude/latitude truth is only registered with geography at 1×.
+  // At accelerated visual Earth rates the marker remains correctly aligned with
+  // the displayed illumination, while the Earth-fixed historical/future track hides.
+  const geographicTrackIsTruthfullyRegistered = earthTimeScale === 1 && !earthRealtimeReconciliation;
+  solarTrackGroup.visible = geographicTrackIsTruthfullyRegistered;
+  if (geographicTrackIsTruthfullyRegistered) updateSolarGroundTrack(realUtcMs);
 }
 
 // Restrained Astronomical Reference Instrument
@@ -666,13 +774,14 @@ let showSatellites = true;
 let catalogCount = 0;
 let elementsRetrievedAt = 0;
 
-const isMobile = window.matchMedia('(max-width: 680px)').matches;
-const maxSatellites = isMobile ? 1800 : 6000;
+const maxSatellites = 6000;
+const satelliteRenderLimit = () => renderQuality === 'MOBILE' ? 1800 : renderQuality === 'DESKTOP_BALANCED' ? 3600 : maxSatellites;
 
 // Explicit Instance-to-Orbiter Mapping Array for 100% Precise Picking
 const satInstanceToOrbiterIndex: number[] = [];
 type ScreenCandidate = { index: number; id: string; x: number; y: number; distancePx: number };
 let satelliteScreenCandidates: ScreenCandidate[] = [];
+const satelliteScreenCandidatePool: ScreenCandidate[] = [];
 
 // Visible Satellite Instanced Glyph Mesh
 const satGlyphsMesh = new THREE.InstancedMesh(
@@ -740,7 +849,7 @@ function clearOrbit() {
 
 // Aircraft Layer State, Instanced Meshes & Explicit Picking Mappings
 let showAircraft = true;
-const maxAircraft = isMobile ? 500 : 1600;
+const maxAircraft = 1600;
 let aircraftApiRawCount = 0;
 type AircraftProvider = 'adsb.lol' | 'adsb.fi' | 'Airplanes.live' | 'OpenSky';
 let aircraftProvider: AircraftProvider | null = null;
@@ -824,6 +933,7 @@ let isTrackingAircraft = false;
 let hoveredIcao: string | null = null;
 let hoveredSatelliteNorad: string | null = null;
 let aircraftScreenCandidates: ScreenCandidate[] = [];
+const aircraftScreenCandidatePool: ScreenCandidate[] = [];
 type MotionProbe = { id: string; startedAt: number; start: THREE.Vector2; deltaPx: number | null };
 let aircraftMotionProbe: MotionProbe | null = null;
 let satelliteMotionProbe: MotionProbe | null = null;
@@ -852,6 +962,8 @@ let isQueueProcessing = false;
 let lastRequestTimeMs = 0;
 let lastCheckedCamPos = { lat: 0, lon: 0, dist: 0 };
 let cameraMoveDebounceTimer: number | null = null;
+let aircraftFetchController: AbortController | null = null;
+let satelliteFetchController: AbortController | null = null;
 
 // Spatial & Label Managers
 const spatialBucketingManager = new SpatialBucketingManager(24);
@@ -877,6 +989,7 @@ const aircraftQuaternionTemp = new THREE.Quaternion();
 const aircraftScaleTemp = new THREE.Vector3();
 const aircraftColorTemp = new THREE.Color();
 const aircraftLatestTemp = new THREE.Vector3();
+const aircraftWorldTemp = new THREE.Vector3();
 
 type LandmarkProbe = { label: string; lat: number; lon: number; screen: THREE.Vector2; start: THREE.Vector2; deltaPx: number; visible: boolean };
 const landmarkProbes: LandmarkProbe[] = [
@@ -894,9 +1007,19 @@ let landmarkProbeWarmupFrames = 0;
 const satMatrixTemp = new THREE.Matrix4();
 const satPosTemp = new THREE.Vector3();
 const satLookTemp = new THREE.Object3D();
+const satWorldTemp = new THREE.Vector3();
+const satCamLocalTemp = new THREE.Vector3();
+const satFrameInverseTemp = new THREE.Matrix4();
+const satScaleTemp = new THREE.Vector3();
+const satScreenTemp = new THREE.Vector2();
+const projectionTemp = new THREE.Vector3();
+const occlusionDirectionTemp = new THREE.Vector3();
+const occlusionClosestTemp = new THREE.Vector3();
+const localCameraTemp = new THREE.Vector3();
+const subsolarMarkerWorldTemp = new THREE.Vector3();
 
 // Helper Utilities
-const eciVector = (value: satellite.EciVec3<number>) => new THREE.Vector3(value.y * scale, value.z * scale, value.x * scale);
+const eciVector = (value: satellite.EciVec3<number>, target = new THREE.Vector3()) => target.set(value.y * scale, value.z * scale, value.x * scale);
 const altitudeForTruth = (item: TruthState) => item.geometricAltitude ?? item.barometricAltitude;
 const formatAge = (seconds: number) => {
   const value = Math.max(0, Math.floor(seconds));
@@ -945,7 +1068,8 @@ function aircraftOrientation(position: THREE.Vector3, heading: number | null, si
 
 function getSubCameraCoordinates(): { lat: number; lon: number; dist: number } {
   earth.updateWorldMatrix(true, false);
-  const local = earth.worldToLocal(camera.position.clone()).normalize();
+  const local = localCameraTemp.copy(camera.position);
+  earth.worldToLocal(local).normalize();
   const clampedY = THREE.MathUtils.clamp(local.y, -1, 1);
   const lat = THREE.MathUtils.radToDeg(Math.asin(clampedY));
   const lon = THREE.MathUtils.radToDeg(Math.atan2(local.x, local.z));
@@ -1054,19 +1178,19 @@ function resolveSelectionIndices() {
 }
 
 function projectWorldPosition(world: THREE.Vector3, target = new THREE.Vector2()) {
-  const ndc = world.clone().project(camera);
+  const ndc = projectionTemp.copy(world).project(camera);
   target.set((ndc.x * 0.5 + 0.5) * window.innerWidth, (-ndc.y * 0.5 + 0.5) * window.innerHeight);
   return { visible: ndc.z >= -1 && ndc.z <= 1 && Math.abs(ndc.x) <= 1 && Math.abs(ndc.y) <= 1, ndc };
 }
 
 /** True when the segment from camera to a point passes through the globe. */
 function isBehindEarth(world: THREE.Vector3) {
-  const toPoint = world.clone().sub(camera.position);
+  const toPoint = occlusionDirectionTemp.copy(world).sub(camera.position);
   const length = toPoint.length();
   if (length <= 0) return true;
   const direction = toPoint.multiplyScalar(1 / length);
   const closestT = THREE.MathUtils.clamp(-camera.position.dot(direction), 0, length);
-  return camera.position.clone().addScaledVector(direction, closestT).length() < earthRadius - 0.002;
+  return occlusionClosestTemp.copy(camera.position).addScaledVector(direction, closestT).length() < earthRadius - 0.002;
 }
 
 function updateLandmarkProbes(nowSeconds: number) {
@@ -1148,7 +1272,7 @@ function updateAircraftPositions() {
   const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
 
   let activeMotionMultiplier = 1.0;
-  aircraftScreenCandidates = [];
+  aircraftScreenCandidates.length = 0;
 
   earth.updateWorldMatrix(true, false);
 
@@ -1202,7 +1326,8 @@ function updateAircraftPositions() {
       motion.longitude,
       motion.altitude,
       motion.visualVelocity,
-      motion.visualHeading
+      motion.visualHeading,
+      motion.screenPos
     );
 
     motion.realScreenSpeedPxPerSec = screenMetrics.screenSpeedPxPerSec;
@@ -1293,13 +1418,20 @@ function updateAircraftPositions() {
 
     // 9. All aircraft positions are Earth-local. Project their world position
     // after the authoritative GMST transform, never the unrotated local point.
-    const worldPosition = motion.displayPosition.clone().applyMatrix4(earth.matrixWorld);
+    const worldPosition = aircraftWorldTemp.copy(motion.displayPosition).applyMatrix4(earth.matrixWorld);
     const projected = projectWorldPosition(worldPosition, motion.screenPos);
     motion.inFrustum = projected.visible && !isBehindEarth(worldPosition);
     motion.facingCamera = !isBehindEarth(worldPosition);
 
     if (motion.inFrustum) {
-      aircraftScreenCandidates.push({ index, id: truth.icao24, x: motion.screenPos.x, y: motion.screenPos.y, distancePx: 0 });
+      const candidate = aircraftScreenCandidatePool[aircraftScreenCandidates.length] ?? { index, id: truth.icao24, x: 0, y: 0, distancePx: 0 };
+      candidate.index = index;
+      candidate.id = truth.icao24;
+      candidate.x = motion.screenPos.x;
+      candidate.y = motion.screenPos.y;
+      candidate.distancePx = 0;
+      if (!aircraftScreenCandidatePool[aircraftScreenCandidates.length]) aircraftScreenCandidatePool.push(candidate);
+      aircraftScreenCandidates.push(candidate);
     }
 
     // Rolling history for trails
@@ -1350,7 +1482,7 @@ function updateAircraftPositions() {
 
     const isSel = selectedAircraftIndex === index;
     // Accurate Camera-to-Aircraft Euclidean distance in World Space
-    const worldPos = motion.displayPosition.clone().applyMatrix4(earth.matrixWorld);
+    const worldPos = aircraftWorldTemp.copy(motion.displayPosition).applyMatrix4(earth.matrixWorld);
     const distToCam = camera.position.distanceTo(worldPos);
 
     const targetPx = isSel ? overlaySizes.aircraftSelected : (motion.lodTier === 'TIER_B' ? overlaySizes.aircraftTierB : overlaySizes.aircraftTierA);
@@ -1419,8 +1551,13 @@ function updateAircraftPositions() {
   }
 }
 
+let lastDomLabelUpdateMs = 0;
 // Callsign, Satellite Name, Cartographic Country & Scientific Line Annotation DOM Manager
 function updateDomLabels(cameraDistance: number) {
+  const nowMs = performance.now();
+  const cadenceMs = renderQuality === 'MOBILE' ? 180 : renderQuality === 'DESKTOP_BALANCED' ? 120 : 80;
+  if (nowMs - lastDomLabelUpdateMs < cadenceMs) return;
+  lastDomLabelUpdateMs = nowMs;
   labelCollisionManager.reset();
   let poolIdx = 0;
   const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
@@ -1709,41 +1846,30 @@ function updateDomLabels(cameraDistance: number) {
   }
 
   // =========================================================================
-  // PRIORITY 6: Day/Night Boundary Annotation (TERMINATOR)
+  // PRIORITY 6: Real-time Subsolar Point Annotation
   // =========================================================================
-  let termLabelEl = document.querySelector<HTMLElement>('#sci-label-terminator');
-  if (cameraDistance >= 6.8) {
-    if (!termLabelEl) {
-      termLabelEl = document.createElement('div');
-      termLabelEl.id = 'sci-label-terminator';
-      termLabelEl.className = 'sci-line-label terminator-label';
-      termLabelEl.textContent = 'TERMINATOR';
-      labelsContainer.appendChild(termLabelEl);
+  let subsolarLabelEl = document.querySelector<HTMLElement>('#sci-label-subsolar');
+  const subsolarGeographicLabelIsTruthful = earthTimeScale === 1 && !earthRealtimeReconciliation;
+  if (cameraDistance >= 8.5 && !isCoarsePointer() && subsolarGeographicLabelIsTruthful) {
+    if (!subsolarLabelEl) {
+      subsolarLabelEl = document.createElement('div');
+      subsolarLabelEl.id = 'sci-label-subsolar';
+      subsolarLabelEl.className = 'sci-line-label subsolar-label';
+      subsolarLabelEl.textContent = 'SUN · SUBSOLAR';
+      labelsContainer.appendChild(subsolarLabelEl);
     }
-
-    const r = earthRadius + 0.004;
-    _sciVecA.set(solarBasisU.x * r, solarBasisU.y * r, solarBasisU.z * r).applyMatrix4(earth.matrixWorld);
-
-    if (_sciVecA.clone().normalize().dot(camDir) >= 0.15 && !isBehindEarth(_sciVecA)) {
-      const sA = new THREE.Vector2();
-      const projA = projectWorldPosition(_sciVecA, sA);
-      if (projA.visible && sA.x >= 28 && sA.x <= window.innerWidth - 28 && sA.y >= 28 && sA.y <= window.innerHeight - 28) {
-        if (labelCollisionManager.tryPlaceLabel(sA.x, sA.y, 72, 12, false)) {
-          termLabelEl.style.display = 'block';
-          termLabelEl.style.left = `${sA.x.toFixed(1)}px`;
-          termLabelEl.style.top = `${sA.y.toFixed(1)}px`;
-          termLabelEl.style.transform = 'translate(-50%, -50%)';
-        } else {
-          termLabelEl.style.display = 'none';
-        }
-      } else {
-        termLabelEl.style.display = 'none';
-      }
+    subsolarMarker.getWorldPosition(subsolarMarkerWorldTemp);
+    const projected = projectWorldPosition(subsolarMarkerWorldTemp, satScreenTemp);
+    if (projected.visible && !isBehindEarth(subsolarMarkerWorldTemp) && labelCollisionManager.tryPlaceLabel(satScreenTemp.x, satScreenTemp.y, 96, 12, false)) {
+      subsolarLabelEl.style.display = 'block';
+      subsolarLabelEl.style.left = `${satScreenTemp.x.toFixed(1)}px`;
+      subsolarLabelEl.style.top = `${(satScreenTemp.y - 12).toFixed(1)}px`;
+      subsolarLabelEl.style.transform = 'translate(-50%, -100%)';
     } else {
-      termLabelEl.style.display = 'none';
+      subsolarLabelEl.style.display = 'none';
     }
-  } else if (termLabelEl) {
-    termLabelEl.style.display = 'none';
+  } else if (subsolarLabelEl) {
+    subsolarLabelEl.style.display = 'none';
   }
 
   // =========================================================================
@@ -1751,7 +1877,7 @@ function updateDomLabels(cameraDistance: number) {
   // =========================================================================
 
   // 7A. Unselected Aircraft
-  const maxPlacedAirLabels = cameraDistance > 16.0 ? 0 : cameraDistance > 9.0 ? 5 : cameraDistance > 5.5 ? 8 : 18;
+  const maxPlacedAirLabels = renderQuality === 'MOBILE' ? (cameraDistance > 9.0 ? 0 : 3) : cameraDistance > 16.0 ? 0 : cameraDistance > 9.0 ? 5 : cameraDistance > 5.5 ? 8 : 18;
   if (showAircraft) {
     for (let index = 0; index < aircraft.length; index++) {
       if (index === selectedAircraftIndex) continue;
@@ -1836,8 +1962,8 @@ function updateDomLabels(cameraDistance: number) {
   }
 
   // 7C. Cartographic Country Labels
-  const maxCountryLabels = cameraDistance > 20.0 ? 12 : cameraDistance > 13.0 ? 24 : cameraDistance > 8.0 ? 42 : 65;
-  const maxCountryTier = cameraDistance > 19.0 ? 1 : cameraDistance > 10.5 ? 2 : 3;
+  const maxCountryLabels = renderQuality === 'MOBILE' ? (cameraDistance > 12 ? 8 : 16) : cameraDistance > 20.0 ? 12 : cameraDistance > 13.0 ? 24 : cameraDistance > 8.0 ? 42 : 65;
+  const maxCountryTier = renderQuality === 'MOBILE' ? 1 : cameraDistance > 19.0 ? 1 : cameraDistance > 10.5 ? 2 : 3;
   let countryPlacedCount = 0;
 
   for (let index = 0; index < COUNTRY_LABELS.length && countryPlacedCount < maxCountryLabels; index++) {
@@ -2098,7 +2224,7 @@ async function processRequestQueue() {
 
   try {
     while (requestQueue.length > 0) {
-      if (!showAircraft) {
+      if (!showAircraft || document.hidden) {
         requestQueue.length = 0;
         break;
       }
@@ -2133,7 +2259,13 @@ async function processRequestQueue() {
           lomax: bounds.lomax.toFixed(2),
         });
 
-        const response = await fetch(`/api/aircraft?${query.toString()}`);
+        aircraftFetchController?.abort();
+        const controller = new AbortController();
+        aircraftFetchController = controller;
+        const timeoutId = window.setTimeout(() => controller.abort(), 7_000);
+        const response = await fetch(`/api/aircraft?${query.toString()}`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (aircraftFetchController === controller) aircraftFetchController = null;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const payload = (await response.json()) as { provider: AircraftProvider; observedAt: number; states: TruthState[] };
@@ -2142,6 +2274,7 @@ async function processRequestQueue() {
         region.aircraftCount = payload.states.length;
         mergeAircraftPayload(payload);
       } catch (err) {
+        if (aircraftFetchController?.signal.aborted) aircraftFetchController = null;
         region.status = 'error';
         region.lastFetchedAt = Date.now() - (REGION_CACHE_TTL_MS - 10000);
         console.warn('[VECTOR aircraft stream]', key, err);
@@ -2224,8 +2357,13 @@ function clearSatelliteData() {
 }
 
 async function loadSatellites() {
+  if (document.hidden) return;
+  satelliteFetchController?.abort();
+  const controller = new AbortController();
+  satelliteFetchController = controller;
+  const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
   try {
-    const response = await fetch('/api/satellites?limit=6000');
+    const response = await fetch('/api/satellites?limit=6000', { signal: controller.signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const payload = (await response.json()) as { catalogCount: number; retrievedAt: number; elements: OmmElement[] };
@@ -2246,40 +2384,67 @@ async function loadSatellites() {
     resolveSelectionIndices();
     satGlyphsMesh.count = Math.min(orbiters.length, maxSatellites);
     $('#satellite-status').textContent = `${orbiters.length.toLocaleString()} RENDERED`;
-    updateSatellites();
+    updateSatellites(true);
   } catch {
-    clearSatelliteData();
+    // Preserve the last valid catalogue across a transient refresh failure.
+    if (orbiters.length === 0) clearSatelliteData();
     $('#satellite-status').textContent = 'UNAVAILABLE';
-    $('#satellite-meta').textContent = 'CELESTRAK GP · NO CURRENT RESPONSE';
+    $('#satellite-meta').textContent = orbiters.length ? 'CELESTRAK GP · STALE CATALOGUE' : 'CELESTRAK GP · NO CURRENT RESPONSE';
+  } finally {
+    clearTimeout(timeoutId);
+    if (satelliteFetchController === controller) satelliteFetchController = null;
   }
 }
 
-// Continuous Frame-by-Frame Satellite Instanced Mesh Propagator
-function updateSatellites() {
+let lastSatelliteFieldUpdateMs = 0;
+function updateSelectedSatelliteVisual(now: Date, viewportHeight = window.innerHeight) {
+  if (selectedSatelliteIndex < 0 || !orbiters[selectedSatelliteIndex]) return;
+  const selProp = satellite.propagate(orbiters[selectedSatelliteIndex].satrec, now);
+  if (!selProp || !selProp.position) return;
+  const pos = eciVector(selProp.position as satellite.EciVec3<number>, satPosTemp);
+  selectedSatHalo.position.copy(pos);
+  selectedSatGlyph.position.copy(pos);
+  selectedSatHalo.lookAt(camera.position);
+  selectedSatGlyph.lookAt(camera.position);
+
+  const satDist = pos.distanceTo(camera.position);
+  selectedSatHalo.scale.setScalar(getWorldScaleForPixelSize(camera, satDist, 16.0, viewportHeight));
+  selectedSatGlyph.scale.setScalar(getWorldScaleForPixelSize(camera, satDist, 9.5, viewportHeight));
+}
+
+// The full catalog is a presentation field, so it refreshes at a bounded visual
+// cadence. A selected satellite is still propagated every animation frame.
+function updateSatellites(force = false) {
   if (!showSatellites) {
     satGlyphsMesh.count = 0;
     return;
   }
 
   const now = new Date();
+  const intervalMs = renderQuality === 'MOBILE' ? 165 : renderQuality === 'DESKTOP_BALANCED' ? 115 : 80;
+  if (!force && now.getTime() - lastSatelliteFieldUpdateMs < intervalMs) {
+    updateSelectedSatelliteVisual(now);
+    return;
+  }
+  lastSatelliteFieldUpdateMs = now.getTime();
 
   equatorialFrame.updateWorldMatrix(true, false);
-  const camLocalPos = camera.position.clone().applyMatrix4(equatorialFrame.matrixWorld.clone().invert());
+  const camLocalPos = satCamLocalTemp.copy(camera.position).applyMatrix4(satFrameInverseTemp.copy(equatorialFrame.matrixWorld).invert());
   const viewportHeight = window.innerHeight;
   const cameraDistance = camera.position.distanceTo(controls.target);
   const satelliteMaterial = satGlyphsMesh.material as THREE.MeshBasicMaterial;
   satelliteMaterial.opacity = THREE.MathUtils.clamp(0.12 + (20 - cameraDistance) * 0.012, 0.12, 0.30);
 
   satInstanceToOrbiterIndex.length = 0;
-  satelliteScreenCandidates = [];
+  satelliteScreenCandidates.length = 0;
   let renderedCount = 0;
 
-  for (let index = 0; index < orbiters.length && renderedCount < maxSatellites; index++) {
+  for (let index = 0; index < orbiters.length && renderedCount < satelliteRenderLimit(); index++) {
     const orbiter = orbiters[index];
     const propagated = satellite.propagate(orbiter.satrec, now);
     if (!propagated || !propagated.position) continue;
 
-    const position = eciVector(propagated.position as satellite.EciVec3<number>);
+    const position = eciVector(propagated.position as satellite.EciVec3<number>, satPosTemp);
     const isSel = selectedSatelliteIndex === index;
     const satDist = position.distanceTo(camLocalPos);
 
@@ -2289,21 +2454,27 @@ function updateSatellites() {
     const satScale = getWorldScaleForPixelSize(camera, satDist, desiredPx, viewportHeight);
 
     // Billboard orientation facing camera
-    satPosTemp.copy(position);
-    satLookTemp.position.copy(satPosTemp);
+    satLookTemp.position.copy(position);
     satLookTemp.lookAt(camLocalPos);
 
-    satMatrixTemp.makeTranslation(satPosTemp.x, satPosTemp.y, satPosTemp.z);
-    satMatrixTemp.multiply(new THREE.Matrix4().makeRotationFromQuaternion(satLookTemp.quaternion));
-    satMatrixTemp.scale(new THREE.Vector3(satScale, satScale, satScale));
+    satMatrixTemp.makeTranslation(position.x, position.y, position.z);
+    satMatrixTemp.multiply(satFrameInverseTemp.makeRotationFromQuaternion(satLookTemp.quaternion));
+    satMatrixTemp.scale(satScaleTemp.setScalar(satScale));
 
     satGlyphsMesh.setMatrixAt(renderedCount, satMatrixTemp);
 
     satInstanceToOrbiterIndex[renderedCount] = index;
-    const worldPosition = position.clone().applyMatrix4(equatorialFrame.matrixWorld);
-    const screen = new THREE.Vector2();
+    const worldPosition = satWorldTemp.copy(position).applyMatrix4(equatorialFrame.matrixWorld);
+    const screen = satScreenTemp;
     if (projectWorldPosition(worldPosition, screen).visible && !isBehindEarth(worldPosition)) {
-      satelliteScreenCandidates.push({ index, id: orbiter.norad, x: screen.x, y: screen.y, distancePx: 0 });
+      const candidate = satelliteScreenCandidatePool[satelliteScreenCandidates.length] ?? { index, id: orbiter.norad, x: 0, y: 0, distancePx: 0 };
+      candidate.index = index;
+      candidate.id = orbiter.norad;
+      candidate.x = screen.x;
+      candidate.y = screen.y;
+      candidate.distancePx = 0;
+      if (!satelliteScreenCandidatePool[satelliteScreenCandidates.length]) satelliteScreenCandidatePool.push(candidate);
+      satelliteScreenCandidates.push(candidate);
     }
     renderedCount++;
   }
@@ -2311,22 +2482,7 @@ function updateSatellites() {
   satGlyphsMesh.count = renderedCount;
   satGlyphsMesh.instanceMatrix.needsUpdate = true;
 
-  if (selectedSatelliteIndex >= 0 && orbiters[selectedSatelliteIndex]) {
-    const selProp = satellite.propagate(orbiters[selectedSatelliteIndex].satrec, now);
-    if (selProp && selProp.position) {
-      const pos = eciVector(selProp.position as satellite.EciVec3<number>);
-      selectedSatHalo.position.copy(pos);
-      selectedSatGlyph.position.copy(pos);
-      selectedSatHalo.lookAt(camera.position);
-      selectedSatGlyph.lookAt(camera.position);
-
-      const satDist = pos.distanceTo(camera.position);
-      const bracketScale = getWorldScaleForPixelSize(camera, satDist, 16.0, viewportHeight);
-      selectedSatHalo.scale.setScalar(bracketScale);
-      const glyphScale = getWorldScaleForPixelSize(camera, satDist, 9.5, viewportHeight);
-      selectedSatGlyph.scale.setScalar(glyphScale);
-    }
-  }
+  updateSelectedSatelliteVisual(now, viewportHeight);
 }
 
 // Calculate Genuine Orbital Period from Satrec Mean Motion (rad/min)
@@ -2662,18 +2818,18 @@ function updateMotionDebugPanel() {
 // temporary instanced-mesh slots. Candidates are rebuilt after every LOD pass.
 let lastPickDistancePx: number | null = null;
 function nearestCandidate(event: PointerEvent) {
-  const candidates: Array<{ type: 'aircraft' | 'satellite'; value: ScreenCandidate; radius: number }> = [];
-  if (showAircraft) aircraftScreenCandidates.forEach((value) => candidates.push({ type: 'aircraft', value, radius: 15 }));
-  if (showSatellites) satelliteScreenCandidates.forEach((value) => candidates.push({ type: 'satellite', value, radius: 13 }));
-  let best: (typeof candidates)[number] | undefined;
-  for (const candidate of candidates) {
-    const distancePx = Math.hypot(event.clientX - candidate.value.x, event.clientY - candidate.value.y);
-    if (distancePx <= candidate.radius && (!best || distancePx < best.value.distancePx)) {
-      candidate.value.distancePx = distancePx;
-      best = candidate;
+  const aircraftRadius = isCoarsePointer() ? 26 : 15;
+  const satelliteRadius = isCoarsePointer() ? 24 : 13;
+  let best: { type: 'aircraft' | 'satellite'; value: ScreenCandidate; distancePx: number } | undefined;
+  const test = (type: 'aircraft' | 'satellite', values: ScreenCandidate[], radius: number) => {
+    for (const value of values) {
+      const distancePx = Math.hypot(event.clientX - value.x, event.clientY - value.y);
+      if (distancePx <= radius && (!best || distancePx < best.distancePx)) best = { type, value, distancePx };
     }
-  }
-  lastPickDistancePx = best?.value.distancePx ?? null;
+  };
+  if (showAircraft) test('aircraft', aircraftScreenCandidates, aircraftRadius);
+  if (showSatellites) test('satellite', satelliteScreenCandidates, satelliteRadius);
+  lastPickDistancePx = best?.distancePx ?? null;
   return best;
 }
 
@@ -2692,6 +2848,7 @@ function clearSelection() {
 }
 
 canvas.addEventListener('pointermove', (event) => {
+  if (isCoarsePointer()) return;
   const hit = nearestCandidate(event);
   const tooltipEl = $('#hover-tooltip');
   hoveredIcao = null;
@@ -3013,12 +3170,59 @@ function render(now: number) {
 scheduleVisibleRegionFetches();
 loadSatellites();
 
-window.setInterval(scheduleVisibleRegionFetches, 25000);
-window.setInterval(loadSatellites, 2 * 60 * 60 * 1000);
+window.setInterval(() => {
+  if (!document.hidden) scheduleVisibleRegionFetches();
+}, 25000);
+window.setInterval(() => {
+  if (!document.hidden) loadSatellites();
+}, 2 * 60 * 60 * 1000);
+
+function setRuntimeStatus(message: string | null) {
+  const status = $('#runtime-status');
+  status.hidden = !message;
+  status.textContent = message ?? '';
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    aircraftFetchController?.abort();
+    satelliteFetchController?.abort();
+    renderer.setAnimationLoop(null);
+    return;
+  }
+
+  // Resume from fresh real UTC without presenting a giant simulation delta.
+  lastFrameTimeSec = Date.now() / 1000;
+  lastSolarEphemerisUpdateMs = 0;
+  lastSolarTrackUpdateMs = 0;
+  lastSatelliteFieldUpdateMs = 0;
+  lastDomLabelUpdateMs = 0;
+  renderer.setAnimationLoop(render);
+  scheduleVisibleRegionFetches();
+  loadSatellites();
+});
+
+canvas.addEventListener('webglcontextlost', (event) => {
+  event.preventDefault();
+  renderer.setAnimationLoop(null);
+  setRuntimeStatus('Graphics context lost · waiting to restore');
+});
+
+canvas.addEventListener('webglcontextrestored', () => {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, renderQuality === 'MOBILE' ? 1.35 : renderQuality === 'DESKTOP_BALANCED' ? 1.5 : 1.7));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  for (const mat of fatLineMaterials) mat.resolution.set(window.innerWidth, window.innerHeight);
+  lastSatelliteFieldUpdateMs = 0;
+  lastSolarEphemerisUpdateMs = 0;
+  setRuntimeStatus(null);
+  if (!document.hidden) renderer.setAnimationLoop(render);
+});
 
 window.addEventListener('resize', () => {
+  renderQuality = detectRenderQuality();
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, renderQuality === 'MOBILE' ? 1.35 : renderQuality === 'DESKTOP_BALANCED' ? 1.5 : 1.7));
   renderer.setSize(window.innerWidth, window.innerHeight);
   for (const mat of fatLineMaterials) {
     mat.resolution.set(window.innerWidth, window.innerHeight);
