@@ -65,15 +65,21 @@ export function createAircraftMarkerGeometry() {
 }
 
 /**
- * Micro directional glyph geometry for Tier A aircraft in dense global view.
- * Crisp micro directional wedge pointing along +Y tangent.
+ * Neutral micro-contact geometry for Tier A aircraft in dense views.
+ * Symmetrical 8-sided compact disc / diamond (normalized diameter 1.0, bounds -0.5 to +0.5).
+ * Completely isotropic: communicates NO fake directional trajectory and creates no arrow noise.
  */
 export function createAircraftMicroGlyphGeometry() {
   const shape = new THREE.Shape();
-  shape.moveTo(0, 0.50);
-  shape.lineTo(-0.35, -0.40);
-  shape.lineTo(0, -0.20);
-  shape.lineTo(0.35, -0.40);
+  const radius = 0.5;
+  const segments = 8;
+  for (let i = 0; i < segments; i++) {
+    const angle = (i / segments) * Math.PI * 2;
+    const x = radius * Math.cos(angle);
+    const y = radius * Math.sin(angle);
+    if (i === 0) shape.moveTo(x, y);
+    else shape.lineTo(x, y);
+  }
   shape.closePath();
   return new THREE.ShapeGeometry(shape);
 }

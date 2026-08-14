@@ -15,14 +15,19 @@ import {
 import {
   greatCirclePropagate,
   geodesicSlerp,
-  calculateScreenVelocity,
-  calculateAdaptiveMotionScale,
+  calculateWorldScreenVelocity,
+  calculateVisualClockRate,
+  getUnifiedOverlaySizes,
   greatCircleDistanceKm,
+  interpolateHeading,
+  interpolateScalar,
+  getExtrapolationConfidence,
   SpatialBucketingManager,
   LabelCollisionManager,
   verifyMotionMath,
 } from './scene/motionEngine';
-import type { TruthState, DisplayState } from './scene/motionEngine';
+import type { TruthState, DisplayState, ObservationAnchor } from './scene/motionEngine';
+import { COUNTRY_LABELS } from './scene/countryLabels';
 import './style.css';
 import './status.css';
 
@@ -355,61 +360,116 @@ earth.add(gridGroup);
 
 // Earth-fixed reference lines provide a quiet visual comparison against the
 // inertial satellite field without altering sidereal truth.
-const earthReferenceMat = new THREE.LineBasicMaterial({ color: 0x6d9caf, transparent: true, opacity: 0.34, depthWrite: false });
+const earthReferenceMat = new THREE.LineBasicMaterial({ color: 0x6d9caf, transparent: true, opacity: 0.28, depthWrite: false });
 function earthReferenceCircle(latitude: number, longitude: number, isMeridian: boolean) {
   const points: THREE.Vector3[] = [];
   for (let step = 0; step <= 120; step++) {
     const value = -180 + step * 3;
     points.push(isMeridian
-      ? latLonToVector3(value / 2, longitude, earthRadius + 0.006)
-      : latLonToVector3(latitude, value, earthRadius + 0.006));
+      ? latLonToVector3(value / 2, longitude, earthRadius + 0.005)
+      : latLonToVector3(latitude, value, earthRadius + 0.005));
   }
   return new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), earthReferenceMat);
 }
 earth.add(earthReferenceCircle(0, 0, false));
 earth.add(earthReferenceCircle(0, 0, true));
 
-// Restrained Astronomical Instrumentation & Axes
+// Restrained Astronomical Reference Instrument
 const instrumentGroup = new THREE.Group();
 
-// Thin Hairline Polar Axis
-const axisGeo = new THREE.BufferGeometry().setAttribute(
-  'position',
-  new THREE.Float32BufferAttribute([0, -4.55, 0, 0, 4.55, 0], 3)
-);
-const axisMat = new THREE.LineBasicMaterial({ color: 0x567585, transparent: true, opacity: 0.18 });
+// 1. Hairline Polar Rotation Axis with Precision Reticle Ticks
+const axisSegments: number[] = [
+  // Polar shaft through Earth's rotational axis
+  0, -4.52, 0,  0, 4.52, 0,
+  // North pole reticle cross-tick
+  -0.06, 4.52, 0,  0.06, 4.52, 0,
+  0, 4.52, -0.06,  0, 4.52, 0.06,
+  // North secondary sub-tick
+  -0.03, 4.25, 0,  0.03, 4.25, 0,
+  0, 4.25, -0.03,  0, 4.25, 0.03,
+  // South pole reticle cross-tick
+  -0.06, -4.52, 0,  0.06, -4.52, 0,
+  0, -4.52, -0.06,  0, -4.52, 0.06,
+  // South secondary sub-tick
+  -0.03, -4.25, 0,  0.03, -4.25, 0,
+  0, -4.25, -0.03,  0, -4.25, 0.03,
+];
+const axisGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(axisSegments, 3));
+const axisMat = new THREE.LineBasicMaterial({ color: 0x7eb0c8, transparent: true, opacity: 0.24, depthWrite: false });
 instrumentGroup.add(new THREE.LineSegments(axisGeo, axisMat));
 
-// Ecliptic Reference Ring
-const eclipticPts: THREE.Vector3[] = [];
-for (let i = 0; i <= 120; i++) {
-  const theta = (i / 120) * Math.PI * 2;
-  const r = 4.38;
+// 2. Subtle Equatorial Reference Ring Floating Outside Surface
+const eqRingRadius = 4.18;
+const eqRingPts: THREE.Vector3[] = [];
+for (let i = 0; i <= 128; i++) {
+  const theta = (i / 128) * Math.PI * 2;
+  eqRingPts.push(new THREE.Vector3(eqRingRadius * Math.cos(theta), 0, eqRingRadius * Math.sin(theta)));
+}
+const eqRingGeo = new THREE.BufferGeometry().setFromPoints(eqRingPts);
+const eqRingMat = new THREE.LineBasicMaterial({ color: 0x5a889f, transparent: true, opacity: 0.18, depthWrite: false });
+instrumentGroup.add(new THREE.Line(eqRingGeo, eqRingMat));
+
+// Equatorial Cardinal & 30° Subdivision Hairline Ticks
+const eqTicksPoints: number[] = [];
+for (let deg = 0; deg < 360; deg += 30) {
+  const rad = deg * (Math.PI / 180);
+  const isCardinal = deg % 90 === 0;
+  const tickLen = isCardinal ? 0.08 : 0.035;
+  const r1 = eqRingRadius - 0.01;
+  const r2 = eqRingRadius + tickLen;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  eqTicksPoints.push(r1 * cos, 0, r1 * sin, r2 * cos, 0, r2 * sin);
+}
+const eqTicksGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(eqTicksPoints, 3));
+const eqTicksMat = new THREE.LineBasicMaterial({ color: 0x76a7bf, transparent: true, opacity: 0.22, depthWrite: false });
+instrumentGroup.add(new THREE.LineSegments(eqTicksGeo, eqTicksMat));
+
+// 3. Ecliptic Normal Reference Guide (Normal to Orbital Plane)
+const eclipticNorm = new THREE.Vector3(-Math.sin(obliquity), Math.cos(obliquity), 0).normalize();
+const eclipticEnd = new THREE.Vector3().copy(eclipticNorm).multiplyScalar(4.52);
+const perpEcliptic = new THREE.Vector3(eclipticNorm.y, -eclipticNorm.x, 0).multiplyScalar(0.045);
+const eclipticGuidePts: THREE.Vector3[] = [
+  new THREE.Vector3(0, 4.02, 0),
+  eclipticEnd,
+  eclipticEnd.clone().sub(perpEcliptic),
+  eclipticEnd.clone().add(perpEcliptic),
+];
+const eclipticGuideGeo = new THREE.BufferGeometry().setFromPoints(eclipticGuidePts);
+const eclipticGuideMat = new THREE.LineBasicMaterial({ color: 0x487085, transparent: true, opacity: 0.20, depthWrite: false });
+instrumentGroup.add(new THREE.LineSegments(eclipticGuideGeo, eclipticGuideMat));
+
+// Subtle Ecliptic Reference Plane Ring
+const eclipticRingPts: THREE.Vector3[] = [];
+for (let i = 0; i <= 128; i++) {
+  const theta = (i / 128) * Math.PI * 2;
+  const r = 4.28;
   const v = new THREE.Vector3(r * Math.cos(theta), 0, r * Math.sin(theta));
   v.applyAxisAngle(new THREE.Vector3(0, 0, 1), obliquity);
-  eclipticPts.push(v);
+  eclipticRingPts.push(v);
 }
-const eclipticGeo = new THREE.BufferGeometry().setFromPoints(eclipticPts);
-const eclipticMat = new THREE.LineDashedMaterial({
-  color: 0x2c3d47,
+const eclipticRingGeo = new THREE.BufferGeometry().setFromPoints(eclipticRingPts);
+const eclipticRingMat = new THREE.LineDashedMaterial({
+  color: 0x3d6377,
   transparent: true,
-  opacity: 0.08,
-  dashSize: 0.12,
-  gapSize: 0.12,
+  opacity: 0.10,
+  dashSize: 0.08,
+  gapSize: 0.10,
+  depthWrite: false,
 });
-const eclipticLine = new THREE.Line(eclipticGeo, eclipticMat);
-eclipticLine.computeLineDistances();
-instrumentGroup.add(eclipticLine);
+const eclipticRingLine = new THREE.Line(eclipticRingGeo, eclipticRingMat);
+eclipticRingLine.computeLineDistances();
+instrumentGroup.add(eclipticRingLine);
 
-// Tilt Arc Close to Polar Axis
+// 4. Precision 23.439° Axial Tilt Arc
 const tiltArcPts: THREE.Vector3[] = [];
-const tiltRadius = 4.22;
-for (let i = 0; i <= 20; i++) {
-  const angle = (i / 20) * obliquity;
+const tiltRadius = 4.36;
+for (let i = 0; i <= 24; i++) {
+  const angle = (i / 24) * obliquity;
   tiltArcPts.push(new THREE.Vector3(-tiltRadius * Math.sin(angle), tiltRadius * Math.cos(angle), 0));
 }
 const tiltGeo = new THREE.BufferGeometry().setFromPoints(tiltArcPts);
-const tiltMat = new THREE.LineBasicMaterial({ color: 0x486475, transparent: true, opacity: 0.18 });
+const tiltMat = new THREE.LineBasicMaterial({ color: 0x7cb2cc, transparent: true, opacity: 0.30, depthWrite: false });
 instrumentGroup.add(new THREE.Line(tiltGeo, tiltMat));
 
 equatorialFrame.add(instrumentGroup);
@@ -426,21 +486,21 @@ const degreeLabels: TieredDegreeLabel[] = [];
 
 function makeLabel(text: string, position: THREE.Vector3, tier: DegreeLabelTier = 'MAJOR', isTiltText = false) {
   const canvas = document.createElement('canvas');
-  canvas.width = 128;
-  canvas.height = 48;
+  canvas.width = 256;
+  canvas.height = 80;
   const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 128, 48);
+  ctx.clearRect(0, 0, 256, 80);
 
-  ctx.font = '500 15px "DM Mono", "Roboto Mono", monospace';
+  ctx.font = '500 24px "DM Mono", "Roboto Mono", monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = '#7699a8';
-  ctx.fillText(text, 64, 24);
+  ctx.fillStyle = tier === 'ANCHOR' ? '#a5d0e6' : tier === 'MAJOR' ? '#78a6bc' : '#578196';
+  ctx.fillText(text, 128, 40);
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.minFilter = THREE.LinearFilter;
 
-  const baseOpacity = tier === 'ANCHOR' ? 0.38 : 0.25;
+  const baseOpacity = tier === 'ANCHOR' ? 0.38 : tier === 'MAJOR' ? 0.24 : 0.16;
   const spriteMaterial = new THREE.SpriteMaterial({
     map: texture,
     transparent: true,
@@ -450,8 +510,8 @@ function makeLabel(text: string, position: THREE.Vector3, tier: DegreeLabelTier 
   const sprite = new THREE.Sprite(spriteMaterial);
   sprite.position.copy(position);
 
-  const baseScale = tier === 'ANCHOR' ? 0.28 : tier === 'MAJOR' ? 0.22 : 0.18;
-  sprite.scale.set(baseScale, baseScale * (48 / 128), 1);
+  const baseScale = tier === 'ANCHOR' ? 0.26 : tier === 'MAJOR' ? 0.20 : 0.16;
+  sprite.scale.set(baseScale, baseScale * (80 / 256), 1);
 
   if (isTiltText) {
     instrumentGroup.add(sprite);
@@ -461,9 +521,9 @@ function makeLabel(text: string, position: THREE.Vector3, tier: DegreeLabelTier 
   degreeLabels.push({ sprite, tier, material: spriteMaterial, isTiltText });
 }
 
-makeLabel('N', new THREE.Vector3(0, 4.62, 0), 'ANCHOR');
-makeLabel('S', new THREE.Vector3(0, -4.62, 0), 'ANCHOR');
-makeLabel('23.44°', new THREE.Vector3(-0.95, 4.28, 0), 'ANCHOR', true);
+makeLabel('N', new THREE.Vector3(0, 4.60, 0), 'ANCHOR', true);
+makeLabel('S', new THREE.Vector3(0, -4.60, 0), 'ANCHOR', true);
+makeLabel('23.439°', new THREE.Vector3(-Math.sin(obliquity * 0.5) * 4.46, Math.cos(obliquity * 0.5) * 4.46, 0), 'ANCHOR', true);
 makeLabel('EQ', latLonToVector3(0, 0, 4.05), 'ANCHOR');
 makeLabel('PM', latLonToVector3(0, 0, 4.05), 'ANCHOR');
 
@@ -624,8 +684,6 @@ let observerGroup: THREE.Group | undefined;
 let observerCoreMaterial: THREE.MeshBasicMaterial | undefined;
 let observerPulse: THREE.Mesh | undefined;
 let observerPulseMaterial: THREE.MeshBasicMaterial | undefined;
-let observerLabel: THREE.Sprite | undefined;
-let observerLabelMaterial: THREE.SpriteMaterial | undefined;
 let observerPulseStartedAt = 0;
 let observerLabelExpiresAt = 0;
 
@@ -673,13 +731,23 @@ const escapeHtml = (value: unknown) =>
 
 function aircraftOrientation(position: THREE.Vector3, heading: number | null, size: number, target: THREE.Matrix4) {
   const normal = aircraftLatestTemp.copy(position).normalize();
-  const latitude = Math.asin(normal.y);
+  const clampedY = THREE.MathUtils.clamp(normal.y, -1, 1);
+  const latitude = Math.asin(clampedY);
   const longitude = Math.atan2(normal.x, normal.z);
 
-  aircraftNorthTemp
-    .set(-Math.sin(latitude) * Math.sin(longitude), Math.cos(latitude), -Math.sin(latitude) * Math.cos(longitude))
-    .normalize();
-  aircraftEastTemp.set(Math.cos(longitude), 0, -Math.sin(longitude)).normalize();
+  if (Math.abs(clampedY) > 0.9995) {
+    // Polar region stability: avoid zero-length vector in tangent frame
+    aircraftEastTemp.set(1, 0, 0).cross(normal).normalize();
+    if (aircraftEastTemp.lengthSq() < 0.001) {
+      aircraftEastTemp.set(0, 0, 1).cross(normal).normalize();
+    }
+    aircraftNorthTemp.crossVectors(normal, aircraftEastTemp).normalize();
+  } else {
+    aircraftNorthTemp
+      .set(-Math.sin(latitude) * Math.sin(longitude), Math.cos(latitude), -Math.sin(latitude) * Math.cos(longitude))
+      .normalize();
+    aircraftEastTemp.set(Math.cos(longitude), 0, -Math.sin(longitude)).normalize();
+  }
 
   const bearing = THREE.MathUtils.degToRad(heading ?? 0);
   aircraftForwardTemp
@@ -833,30 +901,56 @@ function updateAircraftPositions() {
   const cameraDistance = camera.position.distanceTo(controls.target);
   const viewportHeight = window.innerHeight;
 
-  // Screen-Space Apparent Aircraft Sizes:
-  // Deliberately restrained screen-space aircraft hierarchy.
-  const desiredAirPxTierB = THREE.MathUtils.clamp(11.0 - (cameraDistance - 8.0) * 0.32, 4.8, 11.0);
-  const desiredAirPxTierA = THREE.MathUtils.clamp(6.3 - (cameraDistance - 8.0) * 0.17, 3.6, 6.3);
-
-  const markerSizeTierB = getWorldScaleForPixelSize(camera, cameraDistance, desiredAirPxTierB, viewportHeight);
-  const markerSizeTierA = getWorldScaleForPixelSize(camera, cameraDistance, desiredAirPxTierA, viewportHeight);
+  // Unified Responsive Zoom-Aware Screen-Space Sizing
+  const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
 
   let activeMotionMultiplier = 1.0;
   aircraftScreenCandidates = [];
 
+  earth.updateWorldMatrix(true, false);
+
   for (let index = 0; index < aircraft.length; index++) {
     const motion = aircraft[index];
     const truth = motion.truth;
-    const age = nowSeconds - truth.positionTime;
+    const anchor = motion.anchor;
+    const age = Math.max(0, nowSeconds - anchor.positionTime);
     const isSelected = index === selectedAircraftIndex;
+    const isTracked = isSelected && isTrackingAircraft && cameraMode === 'TRACKING';
 
-    if (age >= 120) {
-      motion.opacity = 0;
+    const conf = getExtrapolationConfidence(age);
+    motion.confidence = conf.confidence;
+    motion.opacity = conf.opacity;
+
+    if (conf.isDead || motion.opacity <= 0) {
       continue;
     }
 
-    const screenMetrics = calculateScreenVelocity(
+    // 1. Smoothly converge visual heading, velocity, vertical rate, and altitude toward observed targets
+    motion.visualHeading = interpolateHeading(motion.visualHeading, anchor.trueTrack, deltaSec, 20.0);
+    motion.visualVelocity = interpolateScalar(motion.visualVelocity, anchor.velocity, deltaSec, 2.5);
+    motion.visualVerticalRate = interpolateScalar(motion.visualVerticalRate, anchor.verticalRate, deltaSec, 2.5);
+    motion.visualAltitude = interpolateScalar(motion.visualAltitude, anchor.altitude, deltaSec, 2.0);
+
+    // 2. Analytic Physical Prediction (Authoritative physical dead reckoning)
+    const physicalProp = greatCirclePropagate(
+      anchor.latitude,
+      anchor.longitude,
+      anchor.velocity,
+      anchor.trueTrack,
+      age,
+      1.0
+    );
+    const physicalAlt = Math.max(0, anchor.altitude + anchor.verticalRate * age);
+    motion.physicalPosition = {
+      latitude: physicalProp.latitude,
+      longitude: physicalProp.longitude,
+      altitude: physicalAlt,
+    };
+
+    // 3. World-space screen velocity using authoritative earth.matrixWorld
+    const screenMetrics = calculateWorldScreenVelocity(
       camera,
+      earth.matrixWorld,
       window.innerWidth,
       window.innerHeight,
       earthRadius,
@@ -864,119 +958,109 @@ function updateAircraftPositions() {
       motion.latitude,
       motion.longitude,
       motion.altitude,
-      motion.velocity,
-      motion.trueTrack
+      motion.visualVelocity,
+      motion.visualHeading
     );
 
     motion.realScreenSpeedPxPerSec = screenMetrics.screenSpeedPxPerSec;
-    motion.targetScreenSpeedPxSec = 1.2;
+    motion.targetScreenSpeedPxSec = 1.3;
     motion.inFrustum = screenMetrics.isInFrustum;
     motion.facingCamera = screenMetrics.isFacingCamera;
     motion.screenPos.copy(screenMetrics.screenPos);
 
-    const truthExtrapolated = greatCirclePropagate(
-      truth.latitude,
-      truth.longitude,
-      truth.velocity ?? 0,
-      truth.trueTrack ?? 0,
-      age,
+    // 4. Bounded Visual Clock Rate Calculation (dLead/dt = visualRate - 1.0)
+    const clockMetrics = calculateVisualClockRate(
+      motion.visualVelocity,
+      cameraDistance,
+      isSelected,
+      isTracked,
+      anchor.onGround,
+      motion.confidence,
+      motion.accumulatedVisualLead ?? 0
+    );
+    motion.visualRate = clockMetrics.effectiveRate;
+    
+    // Evolve visual lead smoothly; collapses towards 0 as bound or staleness approaches
+    const leadDelta = (clockMetrics.effectiveRate - 1.0) * deltaSec;
+    motion.accumulatedVisualLead = Math.max(0, Math.min(clockMetrics.maxLeadSec * 1.05, (motion.accumulatedVisualLead ?? 0) + leadDelta));
+    motion.visualLeadSeconds = motion.accumulatedVisualLead;
+
+    // 5. Analytic Display Prediction Target
+    const displayElapsed = age + motion.visualLeadSeconds;
+    const displayTarget = greatCirclePropagate(
+      anchor.latitude,
+      anchor.longitude,
+      motion.visualVelocity,
+      motion.visualHeading,
+      displayElapsed,
       1.0
     );
+    const displayAltTarget = Math.max(0, motion.visualAltitude + motion.visualVerticalRate * displayElapsed);
 
-    motion.truthErrorKm = greatCircleDistanceKm(
-      motion.latitude,
-      motion.longitude,
-      truthExtrapolated.latitude,
-      truthExtrapolated.longitude
-    );
-
-    if (motion.inFrustum && motion.facingCamera) {
-      const truthScreenMetrics = calculateScreenVelocity(
-        camera,
-        window.innerWidth,
-        window.innerHeight,
-        earthRadius,
-        scale,
-        truthExtrapolated.latitude,
-        truthExtrapolated.longitude,
-        altitudeForTruth(truth) ?? motion.altitude,
-        0,
-        0
-      );
-      motion.screenLeadPx = motion.screenPos.distanceTo(truthScreenMetrics.screenPos);
-    } else {
-      motion.screenLeadPx = 0;
-    }
-
-    motion.motionMultiplier = calculateAdaptiveMotionScale(
-      motion.realScreenSpeedPxPerSec,
-      motion.velocity,
-      isSelected,
-      truth.onGround,
-      motion.screenLeadPx,
-      motion.truthErrorKm,
-      motion.targetScreenSpeedPxSec,
-      16.0,
-      45.0
-    );
-
-    motion.displayScreenSpeedPxPerSec = motion.realScreenSpeedPxPerSec * motion.motionMultiplier;
-    motion.screenSpeedPxPerSec = motion.displayScreenSpeedPxPerSec;
-
-    if (motion.inFrustum && motion.facingCamera && motion.motionMultiplier > activeMotionMultiplier) {
-      activeMotionMultiplier = motion.motionMultiplier;
-    }
-
-    // Kinematic Great-Circle Propagation per frame
-    const prop = greatCirclePropagate(
-      motion.latitude,
-      motion.longitude,
-      motion.velocity,
-      motion.trueTrack,
-      deltaSec,
-      motion.motionMultiplier
-    );
-
-    motion.latitude = prop.latitude;
-    motion.longitude = prop.longitude;
-    motion.altitude = Math.max(0, motion.altitude + motion.verticalRate * deltaSec * motion.motionMultiplier);
-
-    if (motion.correctionStartPos) {
-      const correctionAge = nowSeconds - motion.correctionStartedAt;
-      if (correctionAge < motion.correctionDuration) {
-        const t = THREE.MathUtils.smoothstep(correctionAge / motion.correctionDuration, 0, 1);
+    // 6. Smooth Geodesic Reconciliation (if blending from a prior observation anchor)
+    if (motion.reconciling && motion.reconcileDuration > 0) {
+      const elapsedRec = nowSeconds - motion.reconcileStartedAt;
+      const progress = elapsedRec / motion.reconcileDuration;
+      if (progress < 1.0) {
+        const weight = THREE.MathUtils.smoothstep(progress, 0, 1);
         const blended = geodesicSlerp(
-          motion.correctionStartLat,
-          motion.correctionStartLon,
-          motion.latitude,
-          motion.longitude,
-          t
+          motion.blendFromLat,
+          motion.blendFromLon,
+          displayTarget.latitude,
+          displayTarget.longitude,
+          weight
         );
         motion.latitude = blended.latitude;
         motion.longitude = blended.longitude;
+        motion.altitude = THREE.MathUtils.lerp(motion.blendFromAlt, displayAltTarget, weight);
       } else {
-        motion.correctionStartPos = null;
+        motion.reconciling = false;
+        motion.latitude = displayTarget.latitude;
+        motion.longitude = displayTarget.longitude;
+        motion.altitude = displayAltTarget;
       }
+    } else {
+      motion.latitude = displayTarget.latitude;
+      motion.longitude = displayTarget.longitude;
+      motion.altitude = displayAltTarget;
     }
 
+    motion.trueTrack = motion.visualHeading;
+    motion.velocity = motion.visualVelocity;
+    motion.verticalRate = motion.visualVerticalRate;
+
+    // 7. Truth Error & Screen Lead Monitoring
+    motion.truthErrorKm = greatCircleDistanceKm(
+      motion.latitude,
+      motion.longitude,
+      motion.physicalPosition.latitude,
+      motion.physicalPosition.longitude
+    );
+
+    const effMult = motion.visualRate;
+    motion.displayScreenSpeedPxPerSec = motion.realScreenSpeedPxPerSec * effMult;
+
+    if (motion.inFrustum && motion.facingCamera && effMult > activeMotionMultiplier) {
+      activeMotionMultiplier = effMult;
+    }
+
+    // 8. Compute 3D Earth-Local Display Position
     const r = earthRadius + (Math.max(0, motion.altitude) / 1000) * scale + 0.008;
-    // Authoritative visual display position calculated directly from propagated coordinates
     latLonToVector3(motion.latitude, motion.longitude, r, motion.displayPosition);
 
-    // All aircraft positions are Earth-local.  Project their world position
+    // 9. All aircraft positions are Earth-local. Project their world position
     // after the authoritative GMST transform, never the unrotated local point.
     const worldPosition = motion.displayPosition.clone().applyMatrix4(earth.matrixWorld);
     const projected = projectWorldPosition(worldPosition, motion.screenPos);
     motion.inFrustum = projected.visible && !isBehindEarth(worldPosition);
     motion.facingCamera = !isBehindEarth(worldPosition);
+
     if (motion.inFrustum) {
       aircraftScreenCandidates.push({ index, id: truth.icao24, x: motion.screenPos.x, y: motion.screenPos.y, distancePx: 0 });
     }
 
-    const staleFade = age <= 45 ? 1.0 : THREE.MathUtils.clamp(1 - (age - 45) / 75, 0, 1);
-    motion.opacity = staleFade;
-
-    if (nowSeconds - motion.lastHistorySampleTime >= 4.0) {
+    // Rolling history for trails
+    if (nowSeconds - motion.lastHistorySampleTime >= 3.0) {
       motion.history.push({
         lat: motion.latitude,
         lon: motion.longitude,
@@ -991,7 +1075,8 @@ function updateAircraftPositions() {
     }
   }
 
-  spatialBucketingManager.cellSizePx = THREE.MathUtils.clamp(760 / cameraDistance, 22, 42);
+  // Decluttering cell bucket spacing tuned for traffic density (~30-38px regional)
+  spatialBucketingManager.cellSizePx = THREE.MathUtils.clamp(24 + (10.0 - Math.min(10.0, cameraDistance)) * 3.2, 24, 40);
 
   const lodStats = spatialBucketingManager.processLOD(
     aircraft,
@@ -1021,10 +1106,15 @@ function updateAircraftPositions() {
     if (motion.opacity <= 0) continue;
 
     const isSel = selectedAircraftIndex === index;
-    const scaleB = isSel ? markerSizeTierB * 1.13 : markerSizeTierB;
+    // Accurate Camera-to-Aircraft Euclidean distance in World Space
+    const worldPos = motion.displayPosition.clone().applyMatrix4(earth.matrixWorld);
+    const distToCam = camera.position.distanceTo(worldPos);
+
+    const targetPx = isSel ? overlaySizes.aircraftSelected : (motion.lodTier === 'TIER_B' ? overlaySizes.aircraftTierB : overlaySizes.aircraftTierA);
+    const worldScale = getWorldScaleForPixelSize(camera, distToCam, targetPx, viewportHeight);
 
     if (motion.lodTier === 'TIER_B' || isSel) {
-      aircraftOrientation(motion.displayPosition, motion.trueTrack, scaleB, aircraftMatrixTemp);
+      aircraftOrientation(motion.displayPosition, motion.trueTrack, worldScale, aircraftMatrixTemp);
       aircraftMarkersTierB.setMatrixAt(countTierB, aircraftMatrixTemp);
 
       aircraftColorTemp.setRGB(0.92 * motion.opacity, 0.98 * motion.opacity, motion.opacity);
@@ -1033,7 +1123,8 @@ function updateAircraftPositions() {
       tierBInstanceToAircraftIndex[countTierB] = index;
       countTierB++;
     } else {
-      aircraftOrientation(motion.displayPosition, motion.trueTrack, markerSizeTierA, aircraftMatrixTemp);
+      // Neutral micro-contact dot (isotropic, null heading)
+      aircraftOrientation(motion.displayPosition, null, worldScale, aircraftMatrixTemp);
       aircraftMarkersTierA.setMatrixAt(countTierA, aircraftMatrixTemp);
 
       aircraftColorTemp.setRGB(0.55 * motion.opacity, 0.68 * motion.opacity, 0.78 * motion.opacity);
@@ -1044,9 +1135,8 @@ function updateAircraftPositions() {
     }
 
     if (isSel) {
-      const airDist = motion.displayPosition.distanceTo(camera.position);
-      const airGlyphScale = getWorldScaleForPixelSize(camera, airDist, 13.0, viewportHeight);
-      const airHaloScale = getWorldScaleForPixelSize(camera, airDist, 16.0, viewportHeight);
+      const airGlyphScale = getWorldScaleForPixelSize(camera, distToCam, overlaySizes.aircraftSelected, viewportHeight);
+      const airHaloScale = getWorldScaleForPixelSize(camera, distToCam, overlaySizes.aircraftSelected * 1.35, viewportHeight);
 
       selectedAircraftGlyph.position.copy(motion.displayPosition);
       selectedAircraftHalo.position.copy(motion.displayPosition);
@@ -1086,36 +1176,36 @@ function updateAircraftPositions() {
   }
 }
 
-// Callsign & Satellite Name DOM Label Manager
+// Callsign, Satellite Name & Cartographic Country DOM Label Manager
 function updateDomLabels(cameraDistance: number) {
   labelCollisionManager.reset();
   let poolIdx = 0;
+  const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
 
-  if (cameraDistance > 22.0 && selectedAircraftIndex < 0 && selectedSatelliteIndex < 0 && !hoveredIcao) {
-    for (const el of domLabelPool) el.style.display = 'none';
-    return;
-  }
+  // Reduced callsign label density at regional and continental scales
+  const maxPlacedAirLabels = cameraDistance > 16.0 ? 0 : cameraDistance > 9.0 ? 5 : cameraDistance > 5.5 ? 8 : 18;
 
-  const maxPlacedLabels = cameraDistance > 18.0 ? 4 : cameraDistance > 13.0 ? 12 : cameraDistance > 9 ? 24 : 42;
-
-  // 1. Aircraft Callsigns
+  // 1. Aircraft Callsigns (Highest priority)
   if (showAircraft) {
-    for (let index = 0; index < aircraft.length && poolIdx < maxPlacedLabels; index++) {
+    for (let index = 0; index < aircraft.length; index++) {
       const motion = aircraft[index];
       const isSelected = index === selectedAircraftIndex;
       const isHovered = motion.truth.icao24 === hoveredIcao;
 
       if (cameraDistance > 18.0 && !isSelected && !isHovered) continue;
       if (motion.opacity <= 0 || !motion.inFrustum || !motion.facingCamera) continue;
-      if (motion.lodTier === 'TIER_A' && !isSelected && !isHovered && cameraDistance > 12.0) continue;
+      // Micro-contacts (TIER_A) are NEVER labeled unless selected or hovered
+      if (motion.lodTier !== 'TIER_B' && !isSelected && !isHovered) continue;
+      // Limit total placed labels for clean cartographic look
+      if (poolIdx >= maxPlacedAirLabels && !isSelected && !isHovered) continue;
 
       const callsign = (motion.truth.callsign || motion.truth.icao24).trim();
       const flAlt = `FL${Math.round(motion.altitude / 304.8)}`;
       const speedMps = `${Math.round(motion.velocity)} m/s`;
 
-      const showSubtext = cameraDistance < 7.5 || isSelected || isHovered;
-      const widthEstimate = callsign.length * 7 + 16;
-      const heightEstimate = showSubtext ? 28 : 18;
+      const showSubtext = cameraDistance < 6.5 || isSelected || isHovered;
+      const widthEstimate = callsign.length * 6.5 + 14;
+      const heightEstimate = showSubtext ? 26 : 16;
 
       const canPlace = labelCollisionManager.tryPlaceLabel(
         motion.screenPos.x,
@@ -1149,12 +1239,48 @@ function updateDomLabels(cameraDistance: number) {
     }
   }
 
-  // 2. Priority Satellite Names
-  if (showSatellites && poolIdx < maxPlacedLabels) {
+  // 2. Observer Geolocation Coordinates (Crisp DOM/CSS Overlay)
+  let observerCoordEl = document.querySelector<HTMLElement>('#observer-coord-label');
+  if (deviceLat !== null && deviceLon !== null && observerWorldPos) {
+    const screenPos = new THREE.Vector2();
+    const proj = projectWorldPosition(observerWorldPos, screenPos);
+    const isVisible = proj.visible && !isBehindEarth(observerWorldPos);
+    const isRecentlyLocated = Date.now() / 1000 < observerLabelExpiresAt;
+    const showCoords = isVisible && (overlaySizes.observerCoordVisible || isRecentlyLocated);
+
+    if (!observerCoordEl) {
+      observerCoordEl = document.createElement('div');
+      observerCoordEl.id = 'observer-coord-label';
+      observerCoordEl.className = 'observer-coord-label';
+      labelsContainer.appendChild(observerCoordEl);
+    }
+
+    if (showCoords) {
+      observerCoordEl.style.display = 'block';
+      const latText = `${Math.abs(deviceLat).toFixed(2)}°${deviceLat >= 0 ? 'N' : 'S'} · ${Math.abs(deviceLon).toFixed(2)}°${deviceLon >= 0 ? 'E' : 'W'}`;
+      observerCoordEl.textContent = latText;
+      observerCoordEl.style.fontSize = `${overlaySizes.observerCoordFontPx.toFixed(1)}px`;
+
+      const widthEstimate = latText.length * 6.5 + 14;
+      labelCollisionManager.tryPlaceLabel(screenPos.x, screenPos.y - 10, widthEstimate, 14, true);
+
+      const offsetY = screenPos.y < 40 ? (overlaySizes.observerCore / 2 + 14) : -(overlaySizes.observerCore / 2 + 6);
+      observerCoordEl.style.left = `${screenPos.x}px`;
+      observerCoordEl.style.top = `${screenPos.y + offsetY}px`;
+      observerCoordEl.style.opacity = isRecentlyLocated ? '1.0' : (cameraDistance > 16.0 ? '0.70' : '0.92');
+    } else {
+      observerCoordEl.style.display = 'none';
+    }
+  } else if (observerCoordEl) {
+    observerCoordEl.style.display = 'none';
+  }
+
+  // 3. Priority Satellite Names
+  if (showSatellites && poolIdx < maxPlacedAirLabels + 8) {
     const now = new Date();
     equatorialFrame.updateWorldMatrix(true, false);
 
-    for (let index = 0; index < orbiters.length && poolIdx < maxPlacedLabels; index++) {
+    for (let index = 0; index < orbiters.length && poolIdx < maxPlacedAirLabels + 8; index++) {
       const orbiter = orbiters[index];
       const isSelected = index === selectedSatelliteIndex;
       const isHovered = orbiter.norad === hoveredSatelliteNorad;
@@ -1198,6 +1324,66 @@ function updateDomLabels(cameraDistance: number) {
         poolIdx++;
       }
     }
+  }
+
+  // 4. Natural Earth Geographic Country Labels (Cartographic / Restrained)
+  const maxCountryLabels = cameraDistance > 20.0 ? 12 : cameraDistance > 13.0 ? 24 : cameraDistance > 8.0 ? 42 : 65;
+  const maxCountryTier = cameraDistance > 19.0 ? 1 : cameraDistance > 10.5 ? 2 : 3;
+
+  earth.updateWorldMatrix(true, false);
+  const camDir = camera.position.clone().sub(controls.target).normalize();
+  let countryPlacedCount = 0;
+
+  for (let index = 0; index < COUNTRY_LABELS.length && countryPlacedCount < maxCountryLabels; index++) {
+    const country = COUNTRY_LABELS[index];
+    if (country.tier > maxCountryTier) continue;
+
+    // Stable label position derived from Natural Earth / ISO geography
+    const localPos = latLonToVector3(country.lat, country.lon, earthRadius + 0.005);
+    const worldPos = localPos.clone().applyMatrix4(earth.matrixWorld);
+
+    // Reject labels on far side of globe or behind the Earth
+    const facing = worldPos.clone().normalize().dot(camDir);
+    if (facing < 0.12) continue;
+    if (isBehindEarth(worldPos)) continue;
+
+    const screenVec = worldPos.clone().project(camera);
+    if (screenVec.z > 1.0) continue;
+
+    const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
+    const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
+
+    if (screenX < -30 || screenX > window.innerWidth + 30 || screenY < -30 || screenY > window.innerHeight + 30) continue;
+
+    // Subtle collision box to avoid visual clutter with aircraft, satellites, and other countries
+    const widthEstimate = country.name.length * 6.0 + 8;
+    const heightEstimate = 12;
+
+    const canPlace = labelCollisionManager.tryPlaceLabel(screenX, screenY, widthEstimate, heightEstimate, false);
+    if (!canPlace) continue;
+
+    // Fade near limb smoothly
+    const limbFactor = THREE.MathUtils.clamp((facing - 0.12) / 0.32, 0, 1);
+    const baseOpacity = country.tier === 1 ? 0.72 : country.tier === 2 ? 0.58 : 0.46;
+    const opacity = baseOpacity * limbFactor;
+    if (opacity < 0.06) continue;
+
+    let labelEl = domLabelPool[poolIdx];
+    if (!labelEl) {
+      labelEl = document.createElement('div');
+      labelsContainer.appendChild(labelEl);
+      domLabelPool.push(labelEl);
+    }
+
+    labelEl.className = 'country-label';
+    labelEl.style.display = 'block';
+    labelEl.style.left = `${screenX}px`;
+    labelEl.style.top = `${screenY}px`;
+    labelEl.style.opacity = opacity.toFixed(2);
+    labelEl.textContent = country.name;
+
+    poolIdx++;
+    countryPlacedCount++;
   }
 
   for (let i = poolIdx; i < domLabelPool.length; i++) {
@@ -1303,31 +1489,51 @@ async function loadAircraft() {
       const altMeters = altitudeForTruth(item) ?? 10000;
       const initialPos = latLonToVector3(item.latitude, item.longitude, earthRadius + (altMeters / 1000) * scale + 0.008);
 
+      const anchor: ObservationAnchor = {
+        latitude: item.latitude,
+        longitude: item.longitude,
+        altitude: altMeters,
+        velocity: item.velocity ?? 0,
+        trueTrack: item.trueTrack ?? 0,
+        verticalRate: item.verticalRate ?? 0,
+        positionTime: item.positionTime,
+        onGround: item.onGround,
+      };
+
       if (!oldMotion) {
         nextList.push({
           truth: item,
+          anchor,
+          visualHeading: item.trueTrack ?? 0,
+          visualVelocity: item.velocity ?? 0,
+          visualVerticalRate: item.verticalRate ?? 0,
+          visualAltitude: altMeters,
+          accumulatedVisualLead: 0,
+          visualRate: 1.0,
+          visualLeadSeconds: 0,
           latitude: item.latitude,
           longitude: item.longitude,
           altitude: altMeters,
-          velocity: item.velocity ?? 0,
           trueTrack: item.trueTrack ?? 0,
+          velocity: item.velocity ?? 0,
           verticalRate: item.verticalRate ?? 0,
           displayPosition: initialPos,
+          physicalPosition: { latitude: item.latitude, longitude: item.longitude, altitude: altMeters },
+          confidence: 1.0,
           screenPos: new THREE.Vector2(),
-          targetScreenSpeedPxSec: 1.2,
+          targetScreenSpeedPxSec: 1.3,
           realScreenSpeedPxPerSec: 0,
           displayScreenSpeedPxPerSec: 0,
-          screenSpeedPxPerSec: 0,
-          motionMultiplier: 1.0,
           truthErrorKm: 0,
           screenLeadPx: 0,
           inFrustum: true,
           facingCamera: true,
-          correctionStartPos: null,
-          correctionStartLat: item.latitude,
-          correctionStartLon: item.longitude,
-          correctionStartedAt: receivedAt,
-          correctionDuration: 2.0,
+          reconciling: false,
+          blendFromLat: item.latitude,
+          blendFromLon: item.longitude,
+          blendFromAlt: altMeters,
+          reconcileStartedAt: receivedAt,
+          reconcileDuration: 0,
           history: [{ lat: item.latitude, lon: item.longitude, alt: altMeters, time: receivedAt, pos: initialPos.clone() }],
           lastHistorySampleTime: receivedAt,
           lodTier: 'TIER_B',
@@ -1337,18 +1543,31 @@ async function loadAircraft() {
           opacity: 1.0,
         });
       } else if (item.positionTime > oldMotion.truth.positionTime) {
+        const distKm = greatCircleDistanceKm(oldMotion.latitude, oldMotion.longitude, item.latitude, item.longitude);
+        const isFarJump = distKm > 350.0;
+        const corrDuration = isFarJump ? 0 : Math.min(3.5, Math.max(2.0, distKm / 25.0));
+        const timeDelta = Math.max(0, item.positionTime - oldMotion.anchor.positionTime);
+        // Preserve continuous motion by deducting the observation time advance from accumulated lead
+        const preservedLead = Math.max(0, (oldMotion.accumulatedVisualLead ?? 0) - timeDelta);
+
         nextList.push({
           ...oldMotion,
           truth: item,
-          trueTrack: item.trueTrack ?? oldMotion.trueTrack,
-          velocity: item.velocity ?? oldMotion.velocity,
-          verticalRate: item.verticalRate ?? oldMotion.verticalRate,
-          altitude: altMeters,
-          correctionStartPos: oldMotion.displayPosition.clone(),
-          correctionStartLat: oldMotion.latitude,
-          correctionStartLon: oldMotion.longitude,
-          correctionStartedAt: receivedAt,
-          correctionDuration: 2.0,
+          anchor: {
+            ...anchor,
+            velocity: item.velocity ?? oldMotion.anchor.velocity,
+            trueTrack: item.trueTrack ?? oldMotion.anchor.trueTrack,
+            verticalRate: item.verticalRate ?? oldMotion.anchor.verticalRate,
+          },
+          accumulatedVisualLead: preservedLead,
+          visualLeadSeconds: preservedLead,
+          reconciling: !isFarJump,
+          blendFromLat: oldMotion.latitude,
+          blendFromLon: oldMotion.longitude,
+          blendFromAlt: oldMotion.altitude,
+          reconcileStartedAt: receivedAt,
+          reconcileDuration: corrDuration,
+          confidence: 1.0,
           phase: 'OBSERVED',
           opacity: 1.0,
         });
@@ -1636,7 +1855,16 @@ function updateMotionDebugPanel() {
   const visibleLabels = domLabelPool.filter((el) => el.style.display !== 'none').length;
 
   const selectedSatName = selectedSatelliteIndex >= 0 && orbiters[selectedSatelliteIndex] ? orbiters[selectedSatelliteIndex].name : 'NONE';
-  const selectedAirIcao = selectedAircraftIndex >= 0 && aircraft[selectedAircraftIndex] ? aircraft[selectedAircraftIndex].truth.icao24 : 'NONE';
+  const selectedMotion = selectedAircraftIndex >= 0 ? aircraft[selectedAircraftIndex] : null;
+  const selectedAirIcao = selectedMotion ? selectedMotion.truth.icao24 : 'NONE';
+  
+  const airObsAgeStr = selectedMotion ? `${formatAge(Date.now() / 1000 - selectedMotion.anchor.positionTime)} (conf ${(selectedMotion.confidence * 100).toFixed(0)}%)` : '—';
+  const airPhysPredStr = selectedMotion ? `${selectedMotion.physicalPosition.latitude.toFixed(3)}°, ${selectedMotion.physicalPosition.longitude.toFixed(3)}°` : '—';
+  const airDispPredStr = selectedMotion ? `${selectedMotion.latitude.toFixed(3)}°, ${selectedMotion.longitude.toFixed(3)}°` : '—';
+  const airLeadSecStr = selectedMotion ? `${selectedMotion.visualLeadSeconds.toFixed(1)}s (rate ${(selectedMotion.visualRate ?? 1.0).toFixed(1)}×)` : '—';
+  const airTruthDistStr = selectedMotion ? `${selectedMotion.truthErrorKm.toFixed(2)} km (lead ${selectedMotion.screenLeadPx.toFixed(1)}px)` : '—';
+  const airScreenSpeedStr = selectedMotion ? `${selectedMotion.realScreenSpeedPxPerSec.toFixed(2)} px/s (disp ${selectedMotion.displayScreenSpeedPxPerSec.toFixed(2)})` : '—';
+  const airHeadingStr = selectedMotion ? `${selectedMotion.visualHeading.toFixed(1)}° (truth ${selectedMotion.anchor.trueTrack.toFixed(1)}°)` : '—';
 
   const devLatStr = deviceLat !== null ? `${deviceLat.toFixed(4)}°` : '—';
   const devLonStr = deviceLon !== null ? `${deviceLon.toFixed(4)}°` : '—';
@@ -1683,6 +1911,13 @@ function updateMotionDebugPanel() {
     <dt>AIR 5S SCREEN DELTA</dt><dd>${aircraftMotionProbe?.deltaPx?.toFixed(2) ?? 'sampling'} px</dd>
     <dt>AIR HIT</dt><dd>${escapeHtml(lastHitAirCallsign)} [${lastHitAirTier}:${lastHitAirInstanceId}]</dd>
     <dt>AIR SELECTED ICAO24</dt><dd>${escapeHtml(selectedAirIcao.toUpperCase())}</dd>
+    <dt>AIR OBS AGE</dt><dd>${airObsAgeStr}</dd>
+    <dt>AIR PHYS PREDICTED</dt><dd>${airPhysPredStr}</dd>
+    <dt>AIR DISP PREDICTED</dt><dd>${airDispPredStr}</dd>
+    <dt>AIR VISUAL LEAD</dt><dd>${airLeadSecStr}</dd>
+    <dt>AIR TRUTH/DISP DIST</dt><dd>${airTruthDistStr}</dd>
+    <dt>AIR SCREEN VELOCITY</dt><dd>${airScreenSpeedStr}</dd>
+    <dt>AIR HEADING</dt><dd>${airHeadingStr}</dd>
     <dt>AIR LABELS</dt><dd>${visibleLabels.toLocaleString()} PLACED</dd>
     <dt>HOVER TYPE / ID</dt><dd>${hoveredIcao ? `AIRCRAFT / ${escapeHtml(hoveredIcao)}` : hoveredSatelliteNorad ? `SATELLITE / ${escapeHtml(hoveredSatelliteNorad)}` : 'NONE'}</dd>
     <dt>SELECTED TYPE / ID</dt><dd>${selectedAircraftIcao ? `AIRCRAFT / ${escapeHtml(selectedAircraftIcao)}` : selectedSatelliteNorad ? `SATELLITE / ${escapeHtml(selectedSatelliteNorad)}` : 'NONE'}</dd>
@@ -1869,43 +2104,27 @@ function locate() {
       deviceLat = lat;
       deviceLon = lon;
 
-      const localPos = latLonToVector3(lat, lon, earthRadius + 0.015);
+      const localPos = latLonToVector3(lat, lon, earthRadius + 0.008);
 
       if (!observerGroup) {
         observerGroup = new THREE.Group();
-        const coreGeo = new THREE.SphereGeometry(0.010, 12, 12);
-        observerCoreMaterial = new THREE.MeshBasicMaterial({ color: 0x6be0ff });
+        // Normalized unit sphere (diameter 1.0, radius 0.5)
+        const coreGeo = new THREE.SphereGeometry(0.5, 16, 16);
+        observerCoreMaterial = new THREE.MeshBasicMaterial({ color: 0x6be0ff, depthWrite: false });
         observerGroup.add(new THREE.Mesh(coreGeo, observerCoreMaterial));
 
-        const pulseGeo = new THREE.RingGeometry(0.012, 0.022, 20);
-        observerPulseMaterial = new THREE.MeshBasicMaterial({ color: 0x6be0ff, transparent: true, opacity: 0.16, side: THREE.DoubleSide });
+        // Normalized unit ring (diameter 1.0, radius 0.5)
+        const pulseGeo = new THREE.RingGeometry(0.35, 0.5, 32);
+        observerPulseMaterial = new THREE.MeshBasicMaterial({ color: 0x6be0ff, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false });
         observerPulse = new THREE.Mesh(pulseGeo, observerPulseMaterial);
         observerGroup.add(observerPulse);
-
-        const canvas = document.createElement('canvas');
-        canvas.width = 192;
-        canvas.height = 48;
-        const ctx = canvas.getContext('2d')!;
-        ctx.fillStyle = '#6be0ff';
-        ctx.font = '500 12px "DM Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        const latText = `${Math.abs(lat).toFixed(2)}°${lat >= 0 ? 'N' : 'S'}  ${Math.abs(lon).toFixed(2)}°${lon >= 0 ? 'E' : 'W'}`;
-        ctx.fillText(latText, 96, 24);
-
-        const texture = new THREE.CanvasTexture(canvas);
-        observerLabelMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: 0.95 });
-        observerLabel = new THREE.Sprite(observerLabelMaterial);
-        observerLabel.scale.set(0.26, 0.065, 1);
-        observerLabel.position.set(0, 0.055, 0);
-        observerGroup.add(observerLabel);
 
         earth.add(observerGroup);
       }
 
       observerGroup.position.copy(localPos);
       observerPulseStartedAt = Date.now() / 1000;
-      observerLabelExpiresAt = Date.now() / 1000 + 3.0;
+      observerLabelExpiresAt = Date.now() / 1000 + 6.0;
 
       earth.updateWorldMatrix(true, false);
       observerWorldPos = localPos.clone().applyMatrix4(earth.matrixWorld);
@@ -1932,29 +2151,31 @@ function locate() {
 }
 
 function updateObserverBeacon(nowSeconds: number) {
-  if (!observerGroup || !observerPulse || !observerPulseMaterial || !observerLabel || !observerLabelMaterial) return;
+  if (!observerGroup || !observerPulse || !observerPulseMaterial) return;
 
   const cameraDistance = camera.position.distanceTo(controls.target);
   const viewportHeight = window.innerHeight;
+  const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
 
-  const coreScale = getWorldScaleForPixelSize(camera, cameraDistance, 1.7, viewportHeight);
+  earth.updateWorldMatrix(true, false);
+  const worldPos = observerGroup.position.clone().applyMatrix4(earth.matrixWorld);
+  observerWorldPos = worldPos;
+  const distToCam = camera.position.distanceTo(worldPos);
+
+  // 1. Precise Core Scaling in Screen Space (Normalized geometry radius 0.5)
+  const coreScale = getWorldScaleForPixelSize(camera, distToCam, overlaySizes.observerCore, viewportHeight);
   if (observerGroup.children[0]) {
-    observerGroup.children[0].scale.setScalar(coreScale / 0.010);
+    observerGroup.children[0].scale.setScalar(coreScale);
   }
 
+  // 2. Precise Screen-Space Pulse Expansion (1.8x -> 2.3x core)
   const pulseAge = nowSeconds - observerPulseStartedAt;
-  const cycle = (pulseAge % 2.2) / 2.2;
-  const currentPulsePx = 3.0 + cycle * 2.5;
-  const pulseScale = getWorldScaleForPixelSize(camera, cameraDistance, currentPulsePx, viewportHeight);
-  observerPulse.scale.setScalar(pulseScale / 0.017);
+  const cycle = (pulseAge % 2.4) / 2.4;
+  const currentPulsePx = THREE.MathUtils.lerp(overlaySizes.observerPulseMin, overlaySizes.observerPulseMax, cycle);
+  const pulseScale = getWorldScaleForPixelSize(camera, distToCam, currentPulsePx, viewportHeight);
+  observerPulse.scale.setScalar(pulseScale);
   observerPulseMaterial.opacity = (1.0 - cycle) * 0.16;
   observerPulse.lookAt(camera.position);
-
-  if (nowSeconds > observerLabelExpiresAt) {
-    observerLabelMaterial.opacity = Math.max(0, observerLabelMaterial.opacity - 0.05);
-  } else {
-    observerLabelMaterial.opacity = 0.95;
-  }
 }
 
 // Master Animation Frame Loop
@@ -2028,7 +2249,7 @@ function render(now: number) {
   const cameraDist = camera.position.distanceTo(controls.target);
 
   for (const label of degreeLabels) {
-    if (label.isTiltText && cameraDist > 22.0) {
+    if (label.isTiltText && cameraDist > 24.0) {
       label.sprite.visible = false;
       continue;
     }
@@ -2042,9 +2263,11 @@ function render(now: number) {
     }
     const worldPos = label.sprite.getWorldPosition(new THREE.Vector3());
     const facing = worldPos.normalize().dot(cameraDir);
-    if (facing > 0.15) {
-      const targetOpacity = label.tier === 'ANCHOR' ? 0.38 : 0.25;
-      label.material.opacity = Math.min(targetOpacity, (facing - 0.15) * 0.7);
+    const facingThreshold = label.isTiltText ? -0.05 : 0.15;
+
+    if (facing > facingThreshold) {
+      const targetOpacity = label.tier === 'ANCHOR' ? 0.40 : 0.24;
+      label.material.opacity = Math.min(targetOpacity, (facing - facingThreshold) * 0.8);
       label.sprite.visible = true;
     } else {
       label.material.opacity = 0;

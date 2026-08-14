@@ -18,56 +18,88 @@ export type TruthState = {
   category: number | null;
 };
 
-export type DisplayState = {
-  truth: TruthState;
+/**
+ * Authoritative Observation Anchor for time-anchored prediction.
+ * Derived strictly from real sensor observations; never mutated during render loop.
+ */
+export type ObservationAnchor = {
   latitude: number;
   longitude: number;
-  altitude: number; // in meters
+  altitude: number; // meters
+  velocity: number; // m/s
+  trueTrack: number; // deg
+  verticalRate: number; // m/s
+  positionTime: number; // epoch seconds
+  onGround: boolean;
+};
+
+export type DisplayState = {
+  truth: TruthState;
+  
+  // Authoritative Observation Anchor
+  anchor: ObservationAnchor;
+
+  // Filtered / Visual states (converge smoothly over short windows)
+  visualHeading: number;
+  visualVelocity: number;
+  visualVerticalRate: number;
+  visualAltitude: number;
+  
+  // Bounded Visual Clock Rate State (dLead/dt = visualRate - 1)
+  accumulatedVisualLead: number;
+  visualRate: number;
+  visualLeadSeconds: number;
+
+  // Rendered Display Output
+  latitude: number;
+  longitude: number;
+  altitude: number;
   trueTrack: number;
   velocity: number;
   verticalRate: number;
   displayPosition: THREE.Vector3;
-  
-  // Motion multiplier and screen speed metrics
-  motionMultiplier: number;
-  realScreenSpeedPxPerSec: number;
-  targetScreenSpeedPxSec: number;
-  displayScreenSpeedPxPerSec: number;
-  screenLeadPx: number;
+
+  // Analytic metrics & truth monitoring
+  physicalPosition: { latitude: number; longitude: number; altitude: number };
   truthErrorKm: number;
-  screenSpeedPxPerSec: number;
-  
-  // Correction blending
-  correctionStartPos: THREE.Vector3 | null;
-  correctionStartLat: number;
-  correctionStartLon: number;
-  correctionStartedAt: number;
-  correctionDuration: number;
-  
-  // Historical rolling observations (2-5 min)
+  screenLeadPx: number;
+  realScreenSpeedPxPerSec: number;
+  displayScreenSpeedPxPerSec: number;
+  targetScreenSpeedPxSec: number;
+  confidence: number;
+
+  // New Observation Reconciliation (Geodesic Blend from rendered state to analytical target)
+  reconciling: boolean;
+  blendFromLat: number;
+  blendFromLon: number;
+  blendFromAlt: number;
+  reconcileStartedAt: number;
+  reconcileDuration: number;
+
+  // Historical rolling observations for trails
   history: Array<{ lat: number; lon: number; alt: number; time: number; pos: THREE.Vector3 }>;
   lastHistorySampleTime: number;
-  
+
   // LOD & Rendering properties
-  lodTier: 'TIER_A' | 'TIER_B'; // TIER_A = Micro direction glyph, TIER_B = Detailed silhouette
+  lodTier: 'TIER_A' | 'TIER_B';
   inFrustum: boolean;
   facingCamera: boolean;
   screenPos: THREE.Vector2;
   showLabel: boolean;
   labelPosition: THREE.Vector2;
-  
-  // Phase description
+
+  // Phase & Opacity
   phase: 'OBSERVED' | 'INTERPOLATED' | 'ESTIMATED';
   opacity: number;
 };
 
-const EARTH_RADIUS_METERS = 6371000;
+export const EARTH_RADIUS_METERS = 6371000;
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
 
 /**
- * Propagates geographic position along a great-circle path.
- * Uses exact spherical trigonometry.
+ * Propagates geographic position along a great-circle / geodesic path.
+ * Uses exact spherical trigonometry with pole & meridian stability.
  */
 export function greatCirclePropagate(
   latDeg: number,
@@ -77,41 +109,60 @@ export function greatCirclePropagate(
   elapsedSec: number,
   motionMultiplier: number = 1.0
 ): { latitude: number; longitude: number } {
-  if (speedMps <= 0 || elapsedSec <= 0) {
+  if (speedMps <= 0 || elapsedSec <= 0 || motionMultiplier <= 0) {
     return { latitude: latDeg, longitude: lonDeg };
   }
 
   const distanceMeters = speedMps * elapsedSec * motionMultiplier;
   const angularDistance = distanceMeters / EARTH_RADIUS_METERS;
 
+  if (angularDistance < 1e-12) {
+    return { latitude: latDeg, longitude: lonDeg };
+  }
+
   const lat1 = latDeg * DEG2RAD;
   const lon1 = lonDeg * DEG2RAD;
   const bearing = trackDeg * DEG2RAD;
 
-  const lat2 = Math.asin(
-    Math.sin(lat1) * Math.cos(angularDistance) +
-      Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing)
-  );
+  const sinLat1 = Math.sin(lat1);
+  const cosLat1 = Math.cos(lat1);
+  const sinDist = Math.sin(angularDistance);
+  const cosDist = Math.cos(angularDistance);
 
-  let lon2 =
-    lon1 +
-    Math.atan2(
-      Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
-      Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
-    );
+  const sinLat2 = sinLat1 * cosDist + cosLat1 * sinDist * Math.cos(bearing);
+  const clampedSinLat2 = Math.max(-1, Math.min(1, sinLat2));
+  const lat2 = Math.asin(clampedSinLat2);
 
-  // Normalize longitude to [-180, 180]
+  let lon2: number;
+  const cosLat2 = Math.cos(lat2);
+
+  if (Math.abs(cosLat2) < 1e-10) {
+    // Exactly at North or South Pole
+    lon2 = lon1;
+  } else {
+    const y = Math.sin(bearing) * sinDist * cosLat1;
+    const x = cosDist - sinLat1 * clampedSinLat2;
+    lon2 = lon1 + Math.atan2(y, x);
+  }
+
+  // Normalize longitude to [-PI, PI]
   lon2 = ((lon2 + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
 
+  const resLat = THREE.MathUtils.clamp(lat2 * RAD2DEG, -90, 90);
+  const resLon = ((lon2 * RAD2DEG + 540) % 360) - 180;
+
   return {
-    latitude: lat2 * RAD2DEG,
-    longitude: lon2 * RAD2DEG,
+    latitude: resLat,
+    longitude: resLon,
   };
 }
 
+const _tempSlerpA = new THREE.Vector3();
+const _tempSlerpB = new THREE.Vector3();
+
 /**
- * Spherical interpolation (Slerp) between two unit direction vectors or geographic lat/lons.
- * Does not interpolate through the interior of the Earth.
+ * Spherical interpolation (Slerp) between two geographic coordinates.
+ * Operates along the great-circle surface without chord cutting.
  */
 export function geodesicSlerp(
   latA: number,
@@ -124,8 +175,8 @@ export function geodesicSlerp(
 ): { latitude: number; longitude: number; vector: THREE.Vector3 } {
   const clampedT = THREE.MathUtils.clamp(t, 0, 1);
   
-  const vA = latLonToUnitVector(latA, lonA, new THREE.Vector3());
-  const vB = latLonToUnitVector(latB, lonB, new THREE.Vector3());
+  const vA = latLonToUnitVector(latA, lonA, _tempSlerpA);
+  const vB = latLonToUnitVector(latB, lonB, _tempSlerpB);
   
   const dot = THREE.MathUtils.clamp(vA.dot(vB), -1, 1);
   const omega = Math.acos(dot);
@@ -141,8 +192,8 @@ export function geodesicSlerp(
     resVec.copy(vA).multiplyScalar(scaleA).addScaledVector(vB, scaleB).normalize();
   }
 
-  const resLat = RAD2DEG * Math.asin(THREE.MathUtils.clamp(resVec.y, -1, 1));
-  const resLon = RAD2DEG * Math.atan2(resVec.x, resVec.z);
+  const resLat = THREE.MathUtils.clamp(RAD2DEG * Math.asin(THREE.MathUtils.clamp(resVec.y, -1, 1)), -90, 90);
+  const resLon = ((RAD2DEG * Math.atan2(resVec.x, resVec.z) + 540) % 360) - 180;
   
   resVec.multiplyScalar(radius);
   
@@ -159,16 +210,20 @@ export function latLonToUnitVector(latDeg: number, lonDeg: number, target: THREE
   );
 }
 
-const _tempVecA = new THREE.Vector3();
-const _tempVecB = new THREE.Vector3();
+const _tempVecLocalA = new THREE.Vector3();
+const _tempVecLocalB = new THREE.Vector3();
+const _tempVecWorldA = new THREE.Vector3();
+const _tempVecWorldB = new THREE.Vector3();
 const _tempNdcA = new THREE.Vector3();
 const _tempNdcB = new THREE.Vector3();
 
 /**
- * Computes projected screen-space displacement in pixels per second for an aircraft.
+ * Computes projected screen-space displacement in pixels per second using
+ * the EXACT authoritative Earth world matrix transformation and camera projection.
  */
-export function calculateScreenVelocity(
+export function calculateWorldScreenVelocity(
   camera: THREE.Camera,
+  earthMatrixWorld: THREE.Matrix4,
   viewportWidth: number,
   viewportHeight: number,
   earthRadiusScene: number,
@@ -180,35 +235,31 @@ export function calculateScreenVelocity(
   trackDeg: number
 ): { screenSpeedPxPerSec: number; isFacingCamera: boolean; isInFrustum: boolean; screenPos: THREE.Vector2 } {
   const screenPos = new THREE.Vector2(-9999, -9999);
-  
+  const r1 = earthRadiusScene + (Math.max(0, altMeters) / 1000) * scaleFactor + 0.008;
+
+  // Local earth coordinates
+  latLonToUnitVector(latDeg, lonDeg, _tempVecLocalA).multiplyScalar(r1);
+  // Authoritative world position using earth.matrixWorld
+  _tempVecWorldA.copy(_tempVecLocalA).applyMatrix4(earthMatrixWorld);
+
+  _tempNdcA.copy(_tempVecWorldA).project(camera);
+  screenPos.set(((1 + _tempNdcA.x) * viewportWidth) / 2, ((1 - _tempNdcA.y) * viewportHeight) / 2);
+
+  const camWorldPos = _tempVecWorldB.setFromMatrixPosition(camera.matrixWorld);
+  const facing = _tempVecWorldA.clone().normalize().dot(camWorldPos.clone().normalize()) > 0;
+  const inFrustum = Math.abs(_tempNdcA.x) <= 1.15 && Math.abs(_tempNdcA.y) <= 1.15 && _tempNdcA.z <= 1.0;
+
   if (speedMps <= 0) {
-    const r = earthRadiusScene + (Math.max(0, altMeters) / 1000) * scaleFactor + 0.008;
-    const p = latLonToUnitVector(latDeg, lonDeg, _tempVecA).multiplyScalar(r);
-    _tempNdcA.copy(p).project(camera);
-    
-    screenPos.set(((1 + _tempNdcA.x) * viewportWidth) / 2, ((1 - _tempNdcA.y) * viewportHeight) / 2);
-    const facing = p.normalize().dot(_tempVecB.copy(camera.position).normalize()) > 0;
-    const inFrustum = Math.abs(_tempNdcA.x) <= 1.1 && Math.abs(_tempNdcA.y) <= 1.1 && _tempNdcA.z <= 1.0;
-    
     return { screenSpeedPxPerSec: 0, isFacingCamera: facing, isInFrustum: inFrustum, screenPos };
   }
 
-  // Current position
-  const r1 = earthRadiusScene + (Math.max(0, altMeters) / 1000) * scaleFactor + 0.008;
-  latLonToUnitVector(latDeg, lonDeg, _tempVecA).multiplyScalar(r1);
-  _tempNdcA.copy(_tempVecA).project(camera);
-
-  // Position 1 second ahead in physical time (M=1)
+  // Physical displacement 1 second ahead
   const next = greatCirclePropagate(latDeg, lonDeg, speedMps, trackDeg, 1.0, 1.0);
-  latLonToUnitVector(next.latitude, next.longitude, _tempVecB).multiplyScalar(r1);
-  _tempNdcB.copy(_tempVecB).project(camera);
+  latLonToUnitVector(next.latitude, next.longitude, _tempVecLocalB).multiplyScalar(r1);
+  _tempVecWorldB.copy(_tempVecLocalB).applyMatrix4(earthMatrixWorld);
+  _tempNdcB.copy(_tempVecWorldB).project(camera);
 
-  screenPos.set(((1 + _tempNdcA.x) * viewportWidth) / 2, ((1 - _tempNdcA.y) * viewportHeight) / 2);
   const screenPosNext = new THREE.Vector2(((1 + _tempNdcB.x) * viewportWidth) / 2, ((1 - _tempNdcB.y) * viewportHeight) / 2);
-
-  const facing = _tempVecA.normalize().dot(_tempVecB.copy(camera.position).normalize()) > 0;
-  const inFrustum = Math.abs(_tempNdcA.x) <= 1.1 && Math.abs(_tempNdcA.y) <= 1.1 && _tempNdcA.z <= 1.0;
-
   const dx = screenPosNext.x - screenPos.x;
   const dy = screenPosNext.y - screenPos.y;
   const screenSpeedPxPerSec = Math.hypot(dx, dy);
@@ -228,56 +279,253 @@ export function greatCircleDistanceKm(lat1: number, lon1: number, lat2: number, 
   const a =
     Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
     Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) * Math.sin(dLambda / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const c = 2 * Math.atan2(Math.sqrt(Math.max(0, Math.min(1, a))), Math.sqrt(Math.max(0, Math.min(1, 1 - a))));
 
   return (EARTH_RADIUS_METERS / 1000) * c;
 }
 
+export interface UnifiedOverlaySizes {
+  aircraftTierB: number;
+  aircraftTierA: number;
+  aircraftSelected: number;
+  observerCore: number;
+  observerPulseMin: number;
+  observerPulseMax: number;
+  observerCoordFontPx: number;
+  observerCoordVisible: boolean;
+}
+
 /**
- * Calculates adaptive visual motion multiplier M based on real screen velocity,
- * target screen speed, and screen-space / geographic lead bounds.
+ * Unified responsive zoom-aware screen-space pixel sizing for all overlays.
+ * Derived with continuous smoothstep / lerp transitions across camera distance.
+ * Eliminates popping while preventing microscopic contacts or giant stickers.
  */
-export function calculateAdaptiveMotionScale(
-  realScreenSpeedPxPerSec: number,
+export function getUnifiedOverlaySizes(cameraDistance: number): UnifiedOverlaySizes {
+  let aircraftTierB: number;
+  let aircraftTierA: number;
+  let aircraftSelected: number;
+  let observerCore: number;
+  let observerCoordFontPx: number;
+  let observerCoordVisible: boolean;
+
+  if (cameraDistance <= 5.5) {
+    // Close View
+    const t = THREE.MathUtils.clamp((5.5 - cameraDistance) / 1.5, 0, 1);
+    aircraftTierB = THREE.MathUtils.lerp(12.0, 15.0, t);
+    aircraftTierA = THREE.MathUtils.lerp(3.0, 3.8, t);
+    aircraftSelected = THREE.MathUtils.lerp(16.0, 18.0, t);
+    observerCore = THREE.MathUtils.lerp(9.0, 11.0, t);
+    observerCoordFontPx = THREE.MathUtils.lerp(11.0, 12.5, t);
+    observerCoordVisible = true;
+  } else if (cameraDistance <= 9.0) {
+    // Regional View (e.g. Spain/France, India/Bangladesh)
+    const t = THREE.MathUtils.clamp((9.0 - cameraDistance) / 3.5, 0, 1);
+    aircraftTierB = THREE.MathUtils.lerp(9.0, 12.0, t);
+    aircraftTierA = THREE.MathUtils.lerp(2.8, 3.2, t);
+    aircraftSelected = THREE.MathUtils.lerp(14.0, 16.0, t);
+    observerCore = THREE.MathUtils.lerp(7.0, 9.0, t);
+    observerCoordFontPx = THREE.MathUtils.lerp(10.0, 11.0, t);
+    observerCoordVisible = true;
+  } else if (cameraDistance <= 16.0) {
+    // Continental View
+    const t = THREE.MathUtils.clamp((16.0 - cameraDistance) / 7.0, 0, 1);
+    aircraftTierB = THREE.MathUtils.lerp(7.0, 9.0, t);
+    aircraftTierA = THREE.MathUtils.lerp(2.5, 2.8, t);
+    aircraftSelected = THREE.MathUtils.lerp(12.0, 14.0, t);
+    observerCore = THREE.MathUtils.lerp(6.0, 7.0, t);
+    observerCoordFontPx = THREE.MathUtils.lerp(9.0, 10.0, t);
+    observerCoordVisible = true;
+  } else {
+    // Global View
+    const t = THREE.MathUtils.clamp((cameraDistance - 16.0) / 14.0, 0, 1);
+    aircraftTierB = THREE.MathUtils.lerp(7.0, 5.5, t);
+    aircraftTierA = THREE.MathUtils.lerp(2.5, 2.0, t);
+    aircraftSelected = THREE.MathUtils.lerp(12.0, 10.0, t);
+    observerCore = THREE.MathUtils.lerp(6.0, 5.0, t);
+    observerCoordFontPx = 9.0;
+    observerCoordVisible = false; // Hidden at far global unless recently located
+  }
+
+  const observerPulseMin = observerCore * 1.8;
+  const observerPulseMax = observerCore * 2.3;
+
+  return {
+    aircraftTierB,
+    aircraftTierA,
+    aircraftSelected,
+    observerCore,
+    observerPulseMin,
+    observerPulseMax,
+    observerCoordFontPx,
+    observerCoordVisible,
+  };
+}
+
+/**
+ * Backward compatibility alias for aircraft pixel sizes.
+ */
+export function getTargetAircraftPixelSizes(cameraDistance: number): {
+  tierB: number;
+  tierA: number;
+  selected: number;
+} {
+  const sizes = getUnifiedOverlaySizes(cameraDistance);
+  return {
+    tierB: sizes.aircraftTierB,
+    tierA: sizes.aircraftTierA,
+    selected: sizes.aircraftSelected,
+  };
+}
+
+/**
+ * Calculates adaptive visual clock rate and rate damping as lead approaches divergence limit.
+ * 
+ * Target visual clock rate by zoom:
+ * - GLOBAL (> 16.0 Earth radii): ~3.5 - 5.0x (subtle, graceful drift ~0.25-0.45 px/s)
+ * - CONTINENTAL (9.0 - 16.0): ~2.0 - 3.2x
+ * - REGIONAL (5.5 - 9.0): ~1.4 - 2.0x
+ * - CLOSE (<= 5.5): ~1.0 - 1.3x
+ * - TRACKED / ON GROUND: strictly 1.0x
+ */
+export function calculateVisualClockRate(
   speedMps: number,
+  cameraDistance: number,
   isSelected: boolean,
+  isTracked: boolean,
   onGround: boolean,
-  screenLeadPx: number,
-  truthErrorKm: number,
-  targetScreenSpeedPxSec: number = 1.2,
-  maxScreenLeadPx: number = 16.0,
-  maxTruthErrorKm: number = 45.0
+  confidence: number,
+  currentLeadSeconds: number
+): { effectiveRate: number; targetRate: number; maxLeadKm: number; maxLeadSec: number } {
+  if (onGround || speedMps < 2.5 || isTracked || confidence <= 0) {
+    return { effectiveRate: 1.0, targetRate: 1.0, maxLeadKm: 0.5, maxLeadSec: 0 };
+  }
+
+  // 1. Target visual clock rate based on zoom
+  let targetRate = 1.0;
+  let maxLeadKm = 15.0;
+
+  if (cameraDistance <= 5.5) {
+    // Close / Airport scale
+    const t = THREE.MathUtils.clamp((cameraDistance - 4.5) / 1.0, 0, 1);
+    targetRate = THREE.MathUtils.lerp(1.0, 1.25, t);
+    maxLeadKm = THREE.MathUtils.lerp(3.0, 6.0, t);
+  } else if (cameraDistance <= 9.0) {
+    // Regional scale (Spain / France)
+    const t = THREE.MathUtils.clamp((cameraDistance - 5.5) / 3.5, 0, 1);
+    targetRate = THREE.MathUtils.lerp(1.35, 2.0, t);
+    maxLeadKm = THREE.MathUtils.lerp(6.0, 16.0, t);
+  } else if (cameraDistance <= 16.0) {
+    // Continental scale
+    const t = THREE.MathUtils.clamp((cameraDistance - 9.0) / 7.0, 0, 1);
+    targetRate = THREE.MathUtils.lerp(2.0, 3.4, t);
+    maxLeadKm = THREE.MathUtils.lerp(16.0, 28.0, t);
+  } else {
+    // Global scale
+    const t = THREE.MathUtils.clamp((cameraDistance - 16.0) / 12.0, 0, 1);
+    targetRate = THREE.MathUtils.lerp(3.4, 4.8, t);
+    maxLeadKm = THREE.MathUtils.lerp(28.0, 38.0, t);
+  }
+
+  // Selected aircraft: tighter lead limit but still maintains gentle motion
+  if (isSelected) {
+    maxLeadKm = Math.min(maxLeadKm, 10.0);
+    targetRate = 1.0 + (targetRate - 1.0) * 0.5;
+  }
+
+  // 2. Maximum allowed lead in seconds
+  const maxLeadSec = (maxLeadKm * 1000) / Math.max(10, speedMps);
+
+  // 3. Smooth Damping as current lead approaches maxLeadSec
+  const leadRatio = currentLeadSeconds / Math.max(0.1, maxLeadSec);
+
+  let effectiveRate: number;
+  if (leadRatio <= 1.0) {
+    // Lead is below limit: rate scales with headroom
+    const damping = Math.pow(Math.max(0, 1.0 - leadRatio), 1.4);
+    effectiveRate = 1.0 + (targetRate - 1.0) * damping * Math.pow(confidence, 1.2);
+  } else {
+    // Lead is above limit (e.g. just zoomed in): smoothly decelerate below 1.0x to reconverge
+    const overRatio = Math.min(1.5, leadRatio - 1.0);
+    effectiveRate = Math.max(0.82, 1.0 - overRatio * 0.45);
+  }
+
+  return { effectiveRate, targetRate, maxLeadKm, maxLeadSec };
+}
+
+/**
+ * Computes progressive extrapolation confidence and opacity for observations over time.
+ * 0–40s: full confidence (1.0)
+ * 40–90s: progressively reduce visual lead & speed (1.0 -> 0.35)
+ * 90–120s: approach physical-only extrapolation and fade (0.35 -> 0.0)
+ * >=120s: dead / culled
+ */
+export function getExtrapolationConfidence(observationAgeSec: number): {
+  confidence: number;
+  opacity: number;
+  isDead: boolean;
+} {
+  if (observationAgeSec <= 40) {
+    return { confidence: 1.0, opacity: 1.0, isDead: false };
+  }
+  if (observationAgeSec <= 90) {
+    const t = (observationAgeSec - 40) / 50;
+    const smooth = THREE.MathUtils.smoothstep(t, 0, 1);
+    const confidence = 1.0 - smooth * 0.65; // 1.0 -> 0.35
+    return { confidence, opacity: 1.0, isDead: false };
+  }
+  if (observationAgeSec <= 120) {
+    const t = (observationAgeSec - 90) / 30;
+    const smooth = THREE.MathUtils.smoothstep(t, 0, 1);
+    const confidence = 0.35 * (1.0 - smooth); // 0.35 -> 0.0
+    const opacity = 1.0 - smooth; // 1.0 -> 0.0
+    return { confidence, opacity, isDead: false };
+  }
+  return { confidence: 0.0, opacity: 0.0, isDead: true };
+}
+
+/**
+ * Interpolates heading/trueTrack across the shortest angular path with rate limiting.
+ */
+export function interpolateHeading(
+  currentTrackDeg: number,
+  targetTrackDeg: number,
+  deltaSec: number,
+  turnRateDegPerSec: number = 24.0
 ): number {
-  if (isSelected || onGround || speedMps < 2.0) {
-    return 1.0;
+  let diff = ((targetTrackDeg - currentTrackDeg + 540) % 360) - 180;
+  if (Math.abs(diff) < 0.01) {
+    return ((targetTrackDeg % 360) + 360) % 360;
   }
 
-  if (realScreenSpeedPxPerSec <= 0.0001) {
-    return 1.0;
+  const maxStep = turnRateDegPerSec * deltaSec;
+  const expFactor = 1 - Math.exp(-4.5 * deltaSec);
+  const smoothStep = diff * expFactor;
+  
+  let step: number;
+  if (Math.abs(smoothStep) > maxStep) {
+    step = Math.sign(diff) * maxStep;
+  } else {
+    step = smoothStep;
   }
 
-  // Raw uncapped multiplier required to reach target perceptual screen speed
-  const rawMultiplier = targetScreenSpeedPxSec / realScreenSpeedPxPerSec;
+  let next = currentTrackDeg + step;
+  return ((next % 360) + 360) % 360;
+}
 
-  if (rawMultiplier <= 1.0) {
-    // Already moving at or above target perceptual speed naturally (regional / local zoom)
-    return 1.0;
+/**
+ * Smoothly interpolates a scalar value (e.g. speed, verticalRate, altitude).
+ */
+export function interpolateScalar(
+  current: number,
+  target: number,
+  deltaSec: number,
+  rate: number = 3.0
+): number {
+  if (Math.abs(target - current) < 1e-4) {
+    return target;
   }
-
-  // Smoothly damp multiplier as visual screen lead or geographic distance approaches bounds
-  const leadRatio = screenLeadPx / maxScreenLeadPx;
-  const errorRatio = truthErrorKm / maxTruthErrorKm;
-  const maxRatio = Math.max(leadRatio, errorRatio);
-
-  if (maxRatio >= 1.0) {
-    // Reached maximum allowed divergence bound -> decay M to 1.0 to hold position at bound
-    return 1.0;
-  }
-
-  const damping = Math.pow(1.0 - maxRatio, 1.4);
-  const effectiveMultiplier = 1.0 + (rawMultiplier - 1.0) * damping;
-
-  return effectiveMultiplier;
+  const factor = 1 - Math.exp(-rate * deltaSec);
+  return current + (target - current) * factor;
 }
 
 /**
@@ -293,13 +541,13 @@ function stableIcao24Hash(icao24: string): number {
 
 /**
  * Spatial Bucketing LOD Manager
- * Divides viewport into a 2D grid and assigns detailed glyphs (Tier B) vs micro glyphs (Tier A).
+ * Divides viewport into a 2D grid and assigns detailed glyphs (Tier B) vs neutral micro-dots (Tier A).
  */
 export class SpatialBucketingManager {
   public cellSizePx: number;
   private grid: Map<string, DisplayState[]>;
 
-  constructor(cellSizePx: number = 20) {
+  constructor(cellSizePx: number = 28) {
     this.cellSizePx = cellSizePx;
     this.grid = new Map();
   }
@@ -370,7 +618,7 @@ export class SpatialBucketingManager {
         return stableIcao24Hash(b.truth.icao24) - stableIcao24Hash(a.truth.icao24);
       });
 
-      // Top item in cell gets Detailed Glyph (Tier B), next 2 get micro-marks, rest fade
+      // Top item in cell gets Detailed Glyph (Tier B), others become neutral micro-contacts (Tier A)
       for (let rank = 0; rank < cellBucket.length; rank++) {
         const item = cellBucket[rank];
         const isPriority = item.truth.icao24 === (selectedIndex >= 0 ? aircraftList[selectedIndex]?.truth.icao24 : null) || item.truth.icao24 === hoveredIcao;
@@ -378,12 +626,12 @@ export class SpatialBucketingManager {
         if (rank === 0 || isPriority) {
           item.lodTier = 'TIER_B';
           detailedGlyphs++;
-        } else if (rank <= 2) {
-          item.lodTier = 'TIER_A';
         } else {
-          // Faded micro mark for high-density cell overcrowding
           item.lodTier = 'TIER_A';
-          item.opacity = Math.min(item.opacity, 0.15);
+          // If heavily congested cell (>3 items), slightly dim micro marks
+          if (rank > 3) {
+            item.opacity = Math.min(item.opacity, 0.35);
+          }
         }
       }
     }
@@ -443,13 +691,49 @@ export class LabelCollisionManager {
 }
 
 /**
- * Diagnostic Verification Helper for Great-Circle Propagation
+ * Diagnostic Verification Helper for Aircraft Kinematics, Frame-Rate Independence & Time-Anchored Motion
  */
 export function verifyMotionMath(): { success: boolean; log: string[] } {
   const log: string[] = [];
   let success = true;
 
-  // Test 1: North Propagation (0 deg)
+  // Test 1: Analytical Frame-Rate Independence (30 FPS vs 144 FPS)
+  const anchorTest: ObservationAnchor = {
+    latitude: 28.6139, // Delhi
+    longitude: 77.2090,
+    altitude: 10000,
+    velocity: 245.0,
+    trueTrack: 65.0,
+    verticalRate: 0,
+    positionTime: 1000.0,
+    onGround: false,
+  };
+
+  // Simulate 30 FPS for 10 seconds
+  let pos30 = { latitude: 0, longitude: 0 };
+  for (let step = 1; step <= 300; step++) {
+    const t = 1000.0 + step * (10.0 / 300);
+    const elapsed = t - anchorTest.positionTime;
+    pos30 = greatCirclePropagate(anchorTest.latitude, anchorTest.longitude, anchorTest.velocity, anchorTest.trueTrack, elapsed, 1.0);
+  }
+
+  // Simulate 144 FPS for 10 seconds
+  let pos144 = { latitude: 0, longitude: 0 };
+  for (let step = 1; step <= 1440; step++) {
+    const t = 1000.0 + step * (10.0 / 1440);
+    const elapsed = t - anchorTest.positionTime;
+    pos144 = greatCirclePropagate(anchorTest.latitude, anchorTest.longitude, anchorTest.velocity, anchorTest.trueTrack, elapsed, 1.0);
+  }
+
+  const fpsDiffKm = greatCircleDistanceKm(pos30.latitude, pos30.longitude, pos144.latitude, pos144.longitude);
+  if (fpsDiffKm < 0.0001) {
+    log.push(`PASS Frame-rate independence: 30 FPS vs 144 FPS Δ = ${fpsDiffKm.toFixed(6)} km`);
+  } else {
+    log.push(`FAIL Frame-rate independence: 30 FPS vs 144 FPS Δ = ${fpsDiffKm.toFixed(4)} km`);
+    success = false;
+  }
+
+  // Test 2: North Propagation (0 deg)
   const north = greatCirclePropagate(0, 0, 1000, 0, 100, 1.0); // 100km North from (0,0)
   const northExpectedLat = (100000 / EARTH_RADIUS_METERS) * RAD2DEG;
   if (Math.abs(north.latitude - northExpectedLat) > 0.001 || Math.abs(north.longitude) > 0.001) {
@@ -459,31 +743,68 @@ export function verifyMotionMath(): { success: boolean; log: string[] } {
     log.push(`PASS North propagation: 100km N -> lat ${north.latitude.toFixed(4)}°`);
   }
 
-  // Test 2: East Propagation (90 deg)
-  const east = greatCirclePropagate(0, 0, 1000, 90, 100, 1.0); // 100km East from (0,0)
-  const eastExpectedLon = (100000 / EARTH_RADIUS_METERS) * RAD2DEG;
-  if (Math.abs(east.longitude - eastExpectedLon) > 0.001 || Math.abs(east.latitude) > 0.001) {
-    log.push(`FAIL East propagation: got lat ${east.latitude.toFixed(4)}, lon ${east.longitude.toFixed(4)}`);
-    success = false;
+  // Test 3: Anti-Meridian Crossing & Longitude Wrapping (-179.9° heading West)
+  const west = greatCirclePropagate(0, -179.9, 1000, 270, 100, 1.0);
+  if (west.longitude > 0 && west.longitude <= 180) {
+    log.push(`PASS Anti-meridian crossing: lon ${west.longitude.toFixed(4)}°`);
   } else {
-    log.push(`PASS East propagation: 100km E -> lon ${east.longitude.toFixed(4)}°`);
+    log.push(`FAIL Anti-meridian crossing: lon ${west.longitude.toFixed(4)}°`);
+    success = false;
   }
 
-  // Test 3: South Propagation (180 deg)
-  const south = greatCirclePropagate(10, 20, 500, 180, 200, 1.0); // 100km South from (10, 20)
-  if (south.latitude >= 10 || Math.abs(south.longitude - 20) > 0.001) {
-    log.push(`FAIL South propagation: got lat ${south.latitude.toFixed(4)}, lon ${south.longitude.toFixed(4)}`);
-    success = false;
+  // Test 4: Shortest Heading Path Across 0° Boundary (359° -> 1°)
+  const headingStep = interpolateHeading(359, 1, 0.5, 30.0);
+  if (headingStep >= 359 || headingStep <= 5) {
+    log.push(`PASS Shortest heading path: 359° -> 1° stepped to ${headingStep.toFixed(1)}°`);
   } else {
-    log.push(`PASS South propagation: 100km S -> lat ${south.latitude.toFixed(4)}°`);
+    log.push(`FAIL Shortest heading path: 359° -> 1° stepped to ${headingStep.toFixed(1)}°`);
+    success = false;
   }
 
-  // Test 4: West Propagation with Longitude Wrapping (270 deg)
-  const west = greatCirclePropagate(0, -179.9, 1000, 270, 100, 1.0); // West crossing -180
-  if (west.longitude < 0 && west.longitude > -180) {
-    log.push(`PASS West wrapping: cross 180 anti-meridian -> lon ${west.longitude.toFixed(4)}°`);
+  // Test 5: Zero Velocity Remains Stationary
+  const stationary = greatCirclePropagate(12.34, 56.78, 0, 90, 1000, 1.0);
+  if (stationary.latitude === 12.34 && stationary.longitude === 56.78) {
+    log.push(`PASS Stationary check: velocity 0 -> identical coordinates`);
   } else {
-    log.push(`PASS West wrapping: lon ${west.longitude.toFixed(4)}°`);
+    log.push(`FAIL Stationary check`);
+    success = false;
+  }
+
+  // Test 6: Ground Aircraft Has 1.0x Rate & 0 Visual Lead
+  const groundClock = calculateVisualClockRate(15, 20.0, false, false, true, 1.0, 0);
+  if (groundClock.effectiveRate === 1.0) {
+    log.push(`PASS Ground aircraft clock rate = 1.0x`);
+  } else {
+    log.push(`FAIL Ground aircraft clock rate = ${groundClock.effectiveRate}`);
+    success = false;
+  }
+
+  // Test 7: Unified Visual Pixel Sizes at Regional Zoom (Spain/France, India/Bangladesh scale)
+  const unifiedRegional = getUnifiedOverlaySizes(7.0);
+  if (
+    unifiedRegional.aircraftTierB >= 9.0 &&
+    unifiedRegional.aircraftTierB <= 12.0 &&
+    unifiedRegional.aircraftTierA >= 2.8 &&
+    unifiedRegional.aircraftTierA <= 3.5 &&
+    unifiedRegional.observerCore >= 7.0 &&
+    unifiedRegional.observerCore <= 9.0
+  ) {
+    log.push(`PASS Unified regional sizes: Aircraft Tier-B ${unifiedRegional.aircraftTierB.toFixed(1)}px, Tier-A ${unifiedRegional.aircraftTierA.toFixed(1)}px, Observer Core ${unifiedRegional.observerCore.toFixed(1)}px`);
+  } else {
+    log.push(`FAIL Unified regional sizes out of target: ${JSON.stringify(unifiedRegional)}`);
+    success = false;
+  }
+
+  // Test 8: Stale Data Extrapolation Confidence Profile
+  const confFresh = getExtrapolationConfidence(20);
+  const confMid = getExtrapolationConfidence(65);
+  const confStale = getExtrapolationConfidence(105);
+  const confDead = getExtrapolationConfidence(140);
+  if (confFresh.confidence === 1.0 && confMid.confidence > 0.3 && confStale.confidence < 0.3 && confDead.isDead) {
+    log.push(`PASS Stale decay: fresh ${confFresh.confidence.toFixed(1)} -> mid ${confMid.confidence.toFixed(2)} -> stale ${confStale.confidence.toFixed(2)} -> dead`);
+  } else {
+    log.push(`FAIL Stale decay: unexpected profile`);
+    success = false;
   }
 
   return { success, log };
