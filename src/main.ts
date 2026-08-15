@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as satellite from 'satellite.js';
+import { injectSpeedInsights } from '@vercel/speed-insights';
 import coastline from './data/ne_50m_coastline.json';
 import borders from './data/ne_50m_admin_0_boundary_lines_land.json';
 import disputedBorders from './data/ne_50m_admin_0_boundary_lines_disputed_areas.json';
@@ -35,6 +36,9 @@ import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import './style.css';
 import './status.css';
+
+// Initialize Vercel Speed Insights
+injectSpeedInsights();
 
 // Automated Kinematic Verification Check
 const verificationResult = verifyMotionMath();
