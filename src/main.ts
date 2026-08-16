@@ -1018,6 +1018,22 @@ const occlusionClosestTemp = new THREE.Vector3();
 const localCameraTemp = new THREE.Vector3();
 const subsolarMarkerWorldTemp = new THREE.Vector3();
 
+// Cached ECI position of the selected satellite written by updateSelectedSatelliteVisual
+// and consumed by updateDomLabels to avoid a second SGP4 propagation per label cadence.
+let _selectedSatCachedEci: THREE.Vector3 | null = null;
+
+// Scratch objects for updateDomLabels hot path
+const _labelCamDir = new THREE.Vector3();
+const _labelSatWorld = new THREE.Vector3();
+const _labelSatScreen = new THREE.Vector3();
+
+// Scratch objects for LOCATING camera animation (inside render loop)
+const _locateQStart = new THREE.Quaternion();
+const _locateQTarget = new THREE.Quaternion();
+const _locateQCurrent = new THREE.Quaternion();
+const _locateAxisRef = new THREE.Vector3(0, 0, 1);
+const _locateDir = new THREE.Vector3();
+
 // Helper Utilities
 const eciVector = (value: satellite.EciVec3<number>, target = new THREE.Vector3()) => target.set(value.y * scale, value.z * scale, value.x * scale);
 const altitudeForTruth = (item: TruthState) => item.geometricAltitude ?? item.barometricAltitude;
@@ -1561,7 +1577,7 @@ function updateDomLabels(cameraDistance: number) {
   labelCollisionManager.reset();
   let poolIdx = 0;
   const overlaySizes = getUnifiedOverlaySizes(cameraDistance);
-  const camDir = camera.position.clone().sub(controls.target).normalize();
+  const camDir = _labelCamDir.copy(camera.position).sub(controls.target).normalize();
   equatorialFrame.updateWorldMatrix(true, false);
   earth.updateWorldMatrix(true, false);
 
@@ -1599,16 +1615,14 @@ function updateDomLabels(cameraDistance: number) {
   }
 
   // 1B. Selected Satellite Name
-  if (showSatellites && selectedSatelliteIndex >= 0 && orbiters[selectedSatelliteIndex]) {
+  if (showSatellites && selectedSatelliteIndex >= 0 && orbiters[selectedSatelliteIndex] && _selectedSatCachedEci) {
     const orbiter = orbiters[selectedSatelliteIndex];
-    const propagated = satellite.propagate(orbiter.satrec, new Date());
-    if (propagated && propagated.position) {
-      const eciPos = eciVector(propagated.position as satellite.EciVec3<number>);
-      const worldPos = eciPos.clone().applyMatrix4(equatorialFrame.matrixWorld);
-      const screenVec = worldPos.clone().project(camera);
-      if (screenVec.z <= 1.0 && worldPos.clone().normalize().dot(camDir) >= 0.1) {
-        const screenX = (screenVec.x * 0.5 + 0.5) * window.innerWidth;
-        const screenY = (-(screenVec.y * 0.5) + 0.5) * window.innerHeight;
+    {
+      _labelSatWorld.copy(_selectedSatCachedEci).applyMatrix4(equatorialFrame.matrixWorld);
+      _labelSatScreen.copy(_labelSatWorld).project(camera);
+      if (_labelSatScreen.z <= 1.0 && _labelSatWorld.dot(camDir) / (_labelSatWorld.length() || 1) >= 0.1) {
+        const screenX = (_labelSatScreen.x * 0.5 + 0.5) * window.innerWidth;
+        const screenY = (-(_labelSatScreen.y * 0.5) + 0.5) * window.innerHeight;
         const nameStr = orbiter.name.trim() || `NORAD ${orbiter.norad}`;
         const widthEstimate = nameStr.length * 6 + 14;
 
@@ -2072,6 +2086,7 @@ function clearAircraftData() {
 function selectAircraft(index: number) {
   selectedSatelliteIndex = -1;
   selectedSatelliteNorad = null;
+  _selectedSatCachedEci = null;
   selectedSatHalo.visible = false;
   selectedSatGlyph.visible = false;
   clearOrbit();
@@ -2350,6 +2365,7 @@ function clearSatelliteData() {
   orbiters = [];
   selectedSatelliteIndex = -1;
   selectedSatelliteNorad = null;
+  _selectedSatCachedEci = null;
   satGlyphsMesh.count = 0;
   selectedSatHalo.visible = false;
   selectedSatGlyph.visible = false;
@@ -2398,10 +2414,18 @@ async function loadSatellites() {
 
 let lastSatelliteFieldUpdateMs = 0;
 function updateSelectedSatelliteVisual(now: Date, viewportHeight = window.innerHeight) {
-  if (selectedSatelliteIndex < 0 || !orbiters[selectedSatelliteIndex]) return;
+  if (selectedSatelliteIndex < 0 || !orbiters[selectedSatelliteIndex]) {
+    _selectedSatCachedEci = null;
+    return;
+  }
   const selProp = satellite.propagate(orbiters[selectedSatelliteIndex].satrec, now);
-  if (!selProp || !selProp.position) return;
+  if (!selProp || !selProp.position) {
+    _selectedSatCachedEci = null;
+    return;
+  }
   const pos = eciVector(selProp.position as satellite.EciVec3<number>, satPosTemp);
+  if (!_selectedSatCachedEci) _selectedSatCachedEci = new THREE.Vector3();
+  _selectedSatCachedEci.copy(pos);
   selectedSatHalo.position.copy(pos);
   selectedSatGlyph.position.copy(pos);
   selectedSatHalo.lookAt(camera.position);
@@ -2836,6 +2860,7 @@ function nearestCandidate(event: PointerEvent) {
 function clearSelection() {
   selectedSatelliteIndex = -1;
   selectedSatelliteNorad = null;
+  _selectedSatCachedEci = null;
   selectedAircraftIndex = -1;
   selectedAircraftIcao = null;
   isTrackingAircraft = false;
@@ -2912,6 +2937,7 @@ $('#toggle-satellites').addEventListener('click', (event) => {
   if (!showSatellites && selectedSatelliteIndex >= 0) {
     selectedSatelliteIndex = -1;
     selectedSatelliteNorad = null;
+    _selectedSatCachedEci = null;
     selectedSatHalo.visible = false;
     selectedSatGlyph.visible = false;
     clearOrbit();
@@ -3097,18 +3123,17 @@ function render(now: number) {
     const progress = Math.min(1.0, elapsed / locateAnim.duration);
     const ease = 1 - Math.pow(1 - progress, 3);
 
-    const startDir = locateAnim.startCamPos.clone().normalize();
-    const targetDir = locateAnim.targetCamPos.clone().normalize();
     const startDist = locateAnim.startCamPos.length();
     const targetDist = locateAnim.targetCamPos.length();
 
-    const qStart = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), startDir);
-    const qTarget = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), targetDir);
-    const currentQ = qStart.clone().slerp(qTarget, ease);
-    const currentDir = new THREE.Vector3(0, 0, 1).applyQuaternion(currentQ);
+    _locateDir.copy(locateAnim.startCamPos).normalize();
+    _locateQStart.setFromUnitVectors(_locateAxisRef, _locateDir);
+    _locateDir.copy(locateAnim.targetCamPos).normalize();
+    _locateQTarget.setFromUnitVectors(_locateAxisRef, _locateDir);
+    _locateQCurrent.copy(_locateQStart).slerp(_locateQTarget, ease);
     const currentDist = THREE.MathUtils.lerp(startDist, targetDist, ease);
 
-    camera.position.copy(currentDir.multiplyScalar(currentDist));
+    camera.position.copy(_locateAxisRef).applyQuaternion(_locateQCurrent).multiplyScalar(currentDist);
     controls.target.set(0, 0, 0);
 
     if (progress >= 1.0) {
